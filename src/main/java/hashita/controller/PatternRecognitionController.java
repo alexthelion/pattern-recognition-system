@@ -1,211 +1,225 @@
 package hashita.controller;
 
-import hashita.data.CandlePattern;
+import hashita.service.EntrySignalService.EntrySignal;
 import hashita.data.PatternRecognitionResult;
+import hashita.data.Candle;
 import hashita.service.PatternAnalysisService;
-import lombok.RequiredArgsConstructor;
+import hashita.service.EntrySignalService;
+import hashita.service.EnhancedEntrySignalService;
+import hashita.service.CandleBuilderService;
+import hashita.repository.StockDataRepository;
+import hashita.repository.TickerVolumeRepository;
+import hashita.data.entities.StockData;
+import hashita.data.entities.TickerVolume;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.time.LocalDate;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
-/**
- * REST controller for candlestick pattern recognition
- */
 @RestController
-@RequestMapping("/api/patterns")
-@RequiredArgsConstructor
+@RequestMapping("/api")
 @Slf4j
 public class PatternRecognitionController {
-    
-    private final PatternAnalysisService patternAnalysisService;
-    
+
+    @Autowired
+    private PatternAnalysisService patternAnalysisService;
+
+    @Autowired
+    private EntrySignalService entrySignalService;
+
+    @Autowired
+    private EnhancedEntrySignalService enhancedEntrySignalService;
+
+    @Autowired
+    private CandleBuilderService candleBuilderService;
+
+    @Autowired
+    private StockDataRepository stockDataRepository;
+
+    @Autowired
+    private TickerVolumeRepository tickerVolumeRepository;
+
     /**
-     * Analyze patterns for a specific stock on a specific date
-     * GET /api/patterns/analyze?symbol=AAPL&date=2025-04-01&interval=5
+     * Get entry signals with ENHANCED filters (trend + ADX)
      */
-    @GetMapping("/analyze")
-    public ResponseEntity<PatternAnalysisResponse> analyzeStock(
+    @GetMapping("/signals/entry-enhanced")
+    public ResponseEntity<?> getEnhancedEntrySignals(
             @RequestParam String symbol,
-            @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date,
-            @RequestParam(defaultValue = "5") int interval) {
-        
-        log.info("Analyzing patterns for {} on {} with {} minute interval", symbol, date, interval);
-        
-        String dateStr = date.toString();
-        List<PatternRecognitionResult> patterns = 
-                patternAnalysisService.analyzeStockForDate(symbol, dateStr, interval);
-        
-        PatternAnalysisService.PatternSummary summary = 
-                patternAnalysisService.getPatternSummary(patterns);
-        
-        List<PatternRecognitionResult> strongestSignals = 
-                patternAnalysisService.findStrongestSignals(patterns, 5);
-        
-        return ResponseEntity.ok(new PatternAnalysisResponse(
-                symbol,
-                dateStr,
-                interval,
-                patterns,
-                summary,
-                strongestSignals
-        ));
-    }
-    
-    /**
-     * Analyze patterns for a stock over a date range
-     * GET /api/patterns/analyze-range?symbol=AAPL&startDate=2025-04-01&endDate=2025-04-30&interval=5
-     */
-    @GetMapping("/analyze-range")
-    public ResponseEntity<Map<String, List<PatternRecognitionResult>>> analyzeStockRange(
-            @RequestParam String symbol,
-            @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate startDate,
-            @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate endDate,
-            @RequestParam(defaultValue = "5") int interval) {
-        
-        log.info("Analyzing patterns for {} from {} to {} with {} minute interval",
-                symbol, startDate, endDate, interval);
-        
-        Map<String, List<PatternRecognitionResult>> patternsByDate = 
-                patternAnalysisService.analyzeStockForDateRange(
-                        symbol, startDate.toString(), endDate.toString(), interval);
-        
-        return ResponseEntity.ok(patternsByDate);
-    }
-    
-    /**
-     * Analyze patterns for all stocks on a specific date
-     * GET /api/patterns/analyze-all?date=2025-04-01&interval=5
-     */
-    @GetMapping("/analyze-all")
-    public ResponseEntity<Map<String, List<PatternRecognitionResult>>> analyzeAllStocks(
-            @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date,
-            @RequestParam(defaultValue = "5") int interval) {
-        
-        log.info("Analyzing patterns for all stocks on {} with {} minute interval", date, interval);
-        
-        Map<String, List<PatternRecognitionResult>> patternsBySymbol = 
-                patternAnalysisService.analyzeAllStocksForDate(date.toString(), interval);
-        
-        return ResponseEntity.ok(patternsBySymbol);
-    }
-    
-    /**
-     * Get all bullish signals for a stock on a date
-     * GET /api/patterns/bullish?symbol=AAPL&date=2025-04-01&interval=5
-     */
-    @GetMapping("/bullish")
-    public ResponseEntity<List<PatternRecognitionResult>> getBullishPatterns(
-            @RequestParam String symbol,
-            @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date,
+            @RequestParam String date,
             @RequestParam(defaultValue = "5") int interval,
-            @RequestParam(defaultValue = "70") double minConfidence) {
-        
-        List<PatternRecognitionResult> patterns = 
-                patternAnalysisService.analyzeStockForDate(symbol, date.toString(), interval);
-        
-        List<PatternRecognitionResult> bullishPatterns = patterns.stream()
-                .filter(PatternRecognitionResult::isBullish)
-                .filter(p -> p.getConfidence() >= minConfidence)
-                .toList();
-        
-        return ResponseEntity.ok(bullishPatterns);
+            @RequestParam(defaultValue = "75") int minQuality) {
+
+        try {
+            log.info("Getting enhanced entry signals: symbol={}, minQuality={}",
+                    symbol, minQuality);
+
+            // 1. Get patterns
+            List<PatternRecognitionResult> patterns =
+                    patternAnalysisService.analyzeStockForDate(symbol, date, interval);
+
+            if (patterns.isEmpty()) {
+                return ResponseEntity.ok(Map.of(
+                        "symbol", symbol,
+                        "date", date,
+                        "intervalMinutes", interval,
+                        "count", 0,
+                        "signals", Collections.emptyList()
+                ));
+            }
+
+            // 2. Get ALL candles for trend calculation
+            List<Candle> allCandles = getCandlesForDate(symbol, date, interval);
+
+            if (allCandles.isEmpty()) {
+                log.warn("No candles found for {}", symbol);
+                return ResponseEntity.ok(Map.of(
+                        "symbol", symbol,
+                        "date", date,
+                        "count", 0,
+                        "signals", Collections.emptyList()
+                ));
+            }
+
+            // 3. Convert patterns to signals with filters
+            List<EntrySignal> signals = patterns.stream()
+                    .map(pattern -> {
+                        // Get base signal from EntrySignalService
+                        EntrySignal baseSignal = entrySignalService.evaluatePattern(pattern);
+
+                        if (baseSignal == null) {
+                            return null;
+                        }
+
+                        // Apply enhanced filters
+                        return enhancedEntrySignalService.evaluateWithFilters(
+                                pattern, allCandles, baseSignal
+                        );
+                    })
+                    .filter(s -> s != null)
+                    .filter(s -> s.getSignalQuality() >= minQuality)
+                    .sorted(Comparator.comparing(EntrySignal::getTimestamp)
+                            .thenComparing(Comparator.comparingDouble(EntrySignal::getSignalQuality).reversed()))
+                    .collect(Collectors.toList());
+
+            log.info("Found {} high-quality signals (quality >= {})",
+                    signals.size(), minQuality);
+
+            return ResponseEntity.ok(Map.of(
+                    "symbol", symbol,
+                    "date", date,
+                    "intervalMinutes", interval,
+                    "totalPatterns", patterns.size(),
+                    "count", signals.size(),
+                    "signals", signals
+            ));
+
+        } catch (Exception e) {
+            log.error("Error getting enhanced entry signals", e);
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", e.getMessage()));
+        }
     }
-    
+
     /**
-     * Get all bearish signals for a stock on a date
-     * GET /api/patterns/bearish?symbol=AAPL&date=2025-04-01&interval=5
+     * Original entry signals endpoint (no filters)
      */
-    @GetMapping("/bearish")
-    public ResponseEntity<List<PatternRecognitionResult>> getBearishPatterns(
+    @GetMapping("/signals/entry")
+    public ResponseEntity<?> getEntrySignals(
             @RequestParam String symbol,
-            @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date,
-            @RequestParam(defaultValue = "5") int interval,
-            @RequestParam(defaultValue = "70") double minConfidence) {
-        
-        List<PatternRecognitionResult> patterns = 
-                patternAnalysisService.analyzeStockForDate(symbol, date.toString(), interval);
-        
-        List<PatternRecognitionResult> bearishPatterns = patterns.stream()
-                .filter(PatternRecognitionResult::isBearish)
-                .filter(p -> p.getConfidence() >= minConfidence)
-                .toList();
-        
-        return ResponseEntity.ok(bearishPatterns);
-    }
-    
-    /**
-     * Get specific pattern type for a stock
-     * GET /api/patterns/specific?symbol=AAPL&date=2025-04-01&pattern=BULLISH_ENGULFING&interval=5
-     */
-    @GetMapping("/specific")
-    public ResponseEntity<List<PatternRecognitionResult>> getSpecificPattern(
-            @RequestParam String symbol,
-            @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date,
-            @RequestParam CandlePattern pattern,
+            @RequestParam String date,
             @RequestParam(defaultValue = "5") int interval) {
-        
-        List<PatternRecognitionResult> allPatterns = 
-                patternAnalysisService.analyzeStockForDate(symbol, date.toString(), interval);
-        
-        List<PatternRecognitionResult> specificPatterns = 
-                patternAnalysisService.filterByPattern(allPatterns, pattern);
-        
-        return ResponseEntity.ok(specificPatterns);
+
+        try {
+            List<EntrySignal> signals = entrySignalService.findEntrySignals(symbol, date, interval);
+
+            return ResponseEntity.ok(Map.of(
+                    "symbol", symbol,
+                    "date", date,
+                    "intervalMinutes", interval,
+                    "count", signals.size(),
+                    "signals", signals
+            ));
+
+        } catch (Exception e) {
+            log.error("Error getting entry signals", e);
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", e.getMessage()));
+        }
     }
-    
+
     /**
-     * Get summary of all patterns for a stock on a date
-     * GET /api/patterns/summary?symbol=AAPL&date=2025-04-01&interval=5
+     * Get patterns only (no signal evaluation)
      */
-    @GetMapping("/summary")
-    public ResponseEntity<PatternAnalysisService.PatternSummary> getPatternSummary(
+    @GetMapping("/patterns/analyze")
+    public ResponseEntity<?> analyzePatterns(
             @RequestParam String symbol,
-            @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date,
+            @RequestParam String date,
             @RequestParam(defaultValue = "5") int interval) {
-        
-        List<PatternRecognitionResult> patterns = 
-                patternAnalysisService.analyzeStockForDate(symbol, date.toString(), interval);
-        
-        PatternAnalysisService.PatternSummary summary = 
-                patternAnalysisService.getPatternSummary(patterns);
-        
-        return ResponseEntity.ok(summary);
+
+        try {
+            List<PatternRecognitionResult> patterns =
+                    patternAnalysisService.analyzeStockForDate(symbol, date, interval);
+
+            return ResponseEntity.ok(Map.of(
+                    "symbol", symbol,
+                    "date", date,
+                    "intervalMinutes", interval,
+                    "count", patterns.size(),
+                    "patterns", patterns
+            ));
+
+        } catch (Exception e) {
+            log.error("Error analyzing patterns", e);
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", e.getMessage()));
+        }
     }
-    
+
     /**
-     * Get strongest signals (top N by confidence) for a stock
-     * GET /api/patterns/strongest?symbol=AAPL&date=2025-04-01&interval=5&limit=5
+     * Helper method to get all candles for a date
+     * This replicates the logic from PatternAnalysisService
      */
-    @GetMapping("/strongest")
-    public ResponseEntity<List<PatternRecognitionResult>> getStrongestSignals(
-            @RequestParam String symbol,
-            @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date,
-            @RequestParam(defaultValue = "5") int interval,
-            @RequestParam(defaultValue = "5") int limit) {
-        
-        List<PatternRecognitionResult> patterns = 
-                patternAnalysisService.analyzeStockForDate(symbol, date.toString(), interval);
-        
-        List<PatternRecognitionResult> strongestSignals = 
-                patternAnalysisService.findStrongestSignals(patterns, limit);
-        
-        return ResponseEntity.ok(strongestSignals);
+    private List<Candle> getCandlesForDate(String symbol, String date, int intervalMinutes) {
+        try {
+            // Get stock data
+            StockData stockData = stockDataRepository
+                    .findByStockInfoAndDate(symbol, date)
+                    .orElse(null);
+
+            if (stockData == null) {
+                return Collections.emptyList();
+            }
+
+            // Get volume data (optional)
+            List<TickerVolume.IntervalVolume> filteredVolumes;
+            TickerVolume volumeData = tickerVolumeRepository
+                    .findByStockInfoAndDate(symbol, date)
+                    .orElse(null);
+
+            if (volumeData == null) {
+                filteredVolumes = Collections.emptyList();
+            } else {
+                filteredVolumes = volumeData.getIntervalVolumes().stream()
+                        .filter(iv -> iv.getIntervalMinutes() == intervalMinutes)
+                        .collect(Collectors.toList());
+            }
+
+            // Build candles
+            return candleBuilderService.buildCandles(
+                    stockData.getStocksPrices(),
+                    filteredVolumes,
+                    intervalMinutes
+            );
+
+        } catch (Exception e) {
+            log.error("Error getting candles", e);
+            return Collections.emptyList();
+        }
     }
-    
-    /**
-     * Response DTO for pattern analysis
-     */
-    public record PatternAnalysisResponse(
-            String symbol,
-            String date,
-            int intervalMinutes,
-            List<PatternRecognitionResult> patterns,
-            PatternAnalysisService.PatternSummary summary,
-            List<PatternRecognitionResult> strongestSignals
-    ) {}
 }
