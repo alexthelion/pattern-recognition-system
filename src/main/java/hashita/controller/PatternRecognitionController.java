@@ -1,16 +1,12 @@
 package hashita.controller;
 
 import hashita.service.EntrySignalService.EntrySignal;
+import hashita.service.IBKRCandleService;
 import hashita.data.PatternRecognitionResult;
 import hashita.data.Candle;
 import hashita.service.PatternAnalysisService;
 import hashita.service.EntrySignalService;
 import hashita.service.EnhancedEntrySignalService;
-import hashita.service.CandleBuilderService;
-import hashita.repository.StockDataRepository;
-import hashita.repository.TickerVolumeRepository;
-import hashita.data.entities.StockData;
-import hashita.data.entities.TickerVolume;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
@@ -37,51 +33,12 @@ public class PatternRecognitionController {
     private EnhancedEntrySignalService enhancedEntrySignalService;
 
     @Autowired
-    private CandleBuilderService candleBuilderService;
-
-    @Autowired
-    private StockDataRepository stockDataRepository;
-
-    @Autowired
-    private TickerVolumeRepository tickerVolumeRepository;
+    private IBKRCandleService ibkrCandleService;  // ✅ NEW: Use IBKR candles
 
     /**
      * Get entry signals with ENHANCED filters (trend + ADX) - BULLISH ONLY
      *
-     * Filters:
-     * - Only LONG/bullish signals
-     * - Trend alignment
-     * - ADX strength
-     * - Minimum quality threshold
-     *
-     * @param symbol Stock symbol (e.g., "BITF")
-     * @param date Date in yyyy-MM-dd format (e.g., "2025-10-06")
-     * @param interval Candle interval in minutes (default: 5)
-     * @param minQuality Minimum signal quality 0-100 (default: 75)
-     * @return List of bullish entry signals
-     *
-     * Example request:
-     * GET /api/signals/entry-enhanced?symbol=BITF&date=2025-10-06&interval=5&minQuality=75
-     *
-     * Example response:
-     * {
-     *   "symbol": "BITF",
-     *   "date": "2025-10-06",
-     *   "intervalMinutes": 5,
-     *   "totalPatterns": 34,
-     *   "count": 2,
-     *   "signals": [
-     *     {
-     *       "symbol": "BITF",
-     *       "pattern": "BULLISH_ENGULFING",
-     *       "direction": "LONG",
-     *       "entryPrice": 3.46,
-     *       "stopLoss": 3.35,
-     *       "target": 3.76,
-     *       "signalQuality": 95.5
-     *     }
-     *   ]
-     * }
+     * ✅ UPDATED: Now uses IBKR candles with 5-day context
      */
     @GetMapping("/signals/entry-enhanced")
     public ResponseEntity<?> getEnhancedEntrySignals(
@@ -94,7 +51,7 @@ public class PatternRecognitionController {
             log.info("Getting enhanced entry signals: symbol={}, minQuality={}",
                     symbol, minQuality);
 
-            // 1. Get patterns
+            // 1. Get patterns (PatternAnalysisService uses IBKR candles internally)
             List<PatternRecognitionResult> patterns =
                     patternAnalysisService.analyzeStockForDate(symbol, date, interval);
 
@@ -108,8 +65,8 @@ public class PatternRecognitionController {
                 ));
             }
 
-            // 2. Get ALL candles for trend calculation
-            List<Candle> allCandles = getCandlesForDate(symbol, date, interval);
+            // 2. ✅ NEW: Get candles with 5-day context from IBKR cache
+            List<Candle> allCandles = ibkrCandleService.getCandlesWithContext(symbol, date, interval);
 
             if (allCandles.isEmpty()) {
                 log.warn("No candles found for {}", symbol);
@@ -121,7 +78,7 @@ public class PatternRecognitionController {
                 ));
             }
 
-            // 3. Convert patterns to signals with filters
+            // 3. Convert patterns to signals with filters (prevent look-ahead bias)
             List<EntrySignal> signals = patterns.stream()
                     .map(pattern -> {
                         // Get base signal from EntrySignalService
@@ -131,16 +88,26 @@ public class PatternRecognitionController {
                             return null;
                         }
 
-                        // Apply enhanced filters
+                        // CRITICAL: Filter candles to prevent look-ahead bias
+                        // Only use candles UP TO (and including) the pattern's timestamp
+                        List<Candle> candlesUpToPattern = allCandles.stream()
+                                .filter(c -> !c.getTimestamp().isAfter(pattern.getTimestamp()))
+                                .collect(Collectors.toList());
+
+                        if (candlesUpToPattern.isEmpty()) {
+                            log.warn("No historical candles for pattern at {}", pattern.getTimestamp());
+                            return null;
+                        }
+
+                        // Apply enhanced filters with ONLY past data
                         return enhancedEntrySignalService.evaluateWithFilters(
-                                pattern, allCandles, baseSignal
+                                pattern, candlesUpToPattern, baseSignal
                         );
                     })
                     .filter(s -> s != null)
                     .filter(s -> s.getSignalQuality() >= minQuality)
                     .filter(s -> "LONG".equals(s.getDirection().name()))
-                    .sorted(Comparator.comparing(EntrySignal::getTimestamp)
-                            .thenComparing(Comparator.comparingDouble(EntrySignal::getSignalQuality).reversed()))
+                    .sorted(Comparator.comparing(EntrySignal::getTimestamp))  // ✅ Sort by timestamp!
                     .collect(Collectors.toList());
 
             log.info("Found {} high-quality signals (quality >= {})",
@@ -214,48 +181,6 @@ public class PatternRecognitionController {
             log.error("Error analyzing patterns", e);
             return ResponseEntity.internalServerError()
                     .body(Map.of("error", e.getMessage()));
-        }
-    }
-
-    /**
-     * Helper method to get all candles for a date
-     * This replicates the logic from PatternAnalysisService
-     */
-    private List<Candle> getCandlesForDate(String symbol, String date, int intervalMinutes) {
-        try {
-            // Get stock data
-            StockData stockData = stockDataRepository
-                    .findByStockInfoAndDate(symbol, date)
-                    .orElse(null);
-
-            if (stockData == null) {
-                return Collections.emptyList();
-            }
-
-            // Get volume data (optional)
-            List<TickerVolume.IntervalVolume> filteredVolumes;
-            TickerVolume volumeData = tickerVolumeRepository
-                    .findByStockInfoAndDate(symbol, date)
-                    .orElse(null);
-
-            if (volumeData == null) {
-                filteredVolumes = Collections.emptyList();
-            } else {
-                filteredVolumes = volumeData.getIntervalVolumes().stream()
-                        .filter(iv -> iv.getIntervalMinutes() == intervalMinutes)
-                        .collect(Collectors.toList());
-            }
-
-            // Build candles
-            return candleBuilderService.buildCandles(
-                    stockData.getStocksPrices(),
-                    filteredVolumes,
-                    intervalMinutes
-            );
-
-        } catch (Exception e) {
-            log.error("Error getting candles", e);
-            return Collections.emptyList();
         }
     }
 }

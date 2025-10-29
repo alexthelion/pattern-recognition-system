@@ -4,19 +4,23 @@ import hashita.data.Candle;
 import hashita.data.CandlePattern;
 import hashita.data.PatternRecognitionResult;
 import hashita.data.entities.StockData;
-import hashita.data.entities.TickerVolume;
 import hashita.repository.StockDataRepository;
-import hashita.repository.TickerVolumeRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.util.*;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
- * Service to orchestrate pattern recognition on historical stock data
- * Pure pattern detection - no trading logic
+ * ✅ UPDATED: Now uses IBKR candles instead of building from ticks
+ *
+ * Service for analyzing stock patterns
+ * This is the main entry point for pattern detection
  */
 @Service
 @Slf4j
@@ -24,270 +28,159 @@ import java.util.stream.Collectors;
 public class PatternAnalysisService {
 
     private final StockDataRepository stockDataRepository;
-    private final TickerVolumeRepository tickerVolumeRepository;
-    private final CandleBuilderService candleBuilderService;
+    private final IBKRCandleService ibkrCandleService;
     private final PatternRecognitionService patternRecognitionService;
 
     /**
-     * Analyze patterns for a specific stock on a specific date
+     * Analyze a stock for patterns on a specific date
+     *
+     * ✅ NEW: Uses IBKR candles instead of CandleBuilderService
      *
      * @param symbol Stock symbol
      * @param date Date in yyyy-MM-dd format
-     * @param intervalMinutes Candle interval (1, 5, 15, etc.)
+     * @param intervalMinutes Candle interval (1, 5, 15, 30, 60)
      * @return List of detected patterns
      */
-    public List<PatternRecognitionResult> analyzeStockForDate(String symbol, String date, int intervalMinutes) {
-        log.info("Analyzing patterns for {} on {} with {} minute interval", symbol, date, intervalMinutes);
+    public List<PatternRecognitionResult> analyzeStockForDate(
+            String symbol,
+            String date,
+            int intervalMinutes) {
 
-        // Fetch stock data
+        log.debug("Analyzing {} for {} ({}min interval)", symbol, date, intervalMinutes);
+
+        // Verify stock data exists for this date
         Optional<StockData> stockDataOpt = stockDataRepository.findByStockInfoAndDate(symbol, date);
+
         if (stockDataOpt.isEmpty()) {
             log.warn("No stock data found for {} on {}", symbol, date);
-            return Collections.emptyList();
+            return new ArrayList<>();
         }
 
-        StockData stockData = stockDataOpt.get();
-
-        // Fetch volume data (OPTIONAL - proceed without it if not available)
-        Optional<TickerVolume> volumeDataOpt = tickerVolumeRepository.findByStockInfoAndDate(symbol, date);
-
-        List<TickerVolume.IntervalVolume> filteredVolumes;
-        if (volumeDataOpt.isEmpty()) {
-            log.info("No volume data found for {} on {} - proceeding without volume confirmation", symbol, date);
-            filteredVolumes = Collections.emptyList();
-        } else {
-            TickerVolume volumeData = volumeDataOpt.get();
-            filteredVolumes = volumeData.getIntervalVolumes().stream()
-                    .filter(iv -> iv.getIntervalMinutes() == intervalMinutes)
-                    .collect(Collectors.toList());
-        }
-
-        // Build candles (with or without volume)
-        List<Candle> candles = candleBuilderService.buildCandles(
-                stockData.getStocksPrices(),
-                filteredVolumes,
-                intervalMinutes
-        );
+        // ✅ Get candles from CACHE ONLY (never fetch from IBKR during analysis)
+        List<Candle> candles = ibkrCandleService.getCandlesFromCacheOnly(symbol, date, intervalMinutes);
 
         if (candles.isEmpty()) {
-            log.warn("No candles built for {} on {}", symbol, date);
-            return Collections.emptyList();
+            log.warn("No candles available for {} on {}", symbol, date);
+            return new ArrayList<>();
         }
 
-        log.info("Built {} candles for {} on {}", candles.size(), symbol, date);
+        if (candles.size() < 10) {
+            log.warn("Insufficient candles for {}: {} (need at least 10)", symbol, candles.size());
+            return new ArrayList<>();
+        }
 
-        // Scan for patterns
-        List<PatternRecognitionResult> patterns = patternRecognitionService.scanForPatterns(candles, symbol);
+        log.debug("Analyzing {} candles for {}", candles.size(), symbol);
 
-        log.info("Found {} patterns for {} on {}", patterns.size(), symbol, date);
+        // Run pattern detection on all candles (for context)
+        List<PatternRecognitionResult> allPatterns =
+                patternRecognitionService.scanForPatterns(candles, symbol);
 
-        return patterns;
+        // ✅ FILTER: Only return patterns from the requested date!
+        LocalDate targetDate = LocalDate.parse(date);
+        List<PatternRecognitionResult> patternsForDate = allPatterns.stream()
+                .filter(pattern -> {
+                    LocalDate patternDate = pattern.getTimestamp()
+                            .atZone(ZoneId.of("UTC"))
+                            .toLocalDate();
+                    return patternDate.equals(targetDate);
+                })
+                .collect(Collectors.toList());
+
+        log.info("Found {} patterns for {} on {} (out of {} total from context)",
+                patternsForDate.size(), symbol, date, allPatterns.size());
+
+        return patternsForDate;
     }
 
     /**
-     * Analyze patterns for a stock over a date range
+     * Analyze multiple stocks for a specific date
      *
-     * @param symbol Stock symbol
-     * @param startDate Start date (yyyy-MM-dd)
-     * @param endDate End date (yyyy-MM-dd)
+     * @param date Date in yyyy-MM-dd format
      * @param intervalMinutes Candle interval
-     * @return Map of date to patterns
+     * @return Map of symbol → patterns
      */
-    public Map<String, List<PatternRecognitionResult>> analyzeStockForDateRange(
-            String symbol, String startDate, String endDate, int intervalMinutes) {
+    public java.util.Map<String, List<PatternRecognitionResult>> analyzeAllStocksForDate(
+            String date,
+            int intervalMinutes) {
 
-        log.info("Analyzing patterns for {} from {} to {} with {} minute interval",
-                symbol, startDate, endDate, intervalMinutes);
+        log.info("Analyzing all stocks for {} ({}min interval)", date, intervalMinutes);
 
-        // Fetch all stock data for date range
-        List<StockData> stockDataList = stockDataRepository
-                .findByStockInfoAndDateBetween(symbol, startDate, endDate);
-
-        // Fetch all volume data for date range (OPTIONAL)
-        List<TickerVolume> volumeDataList = tickerVolumeRepository
-                .findByStockInfoAndDateBetween(symbol, startDate, endDate);
-
-        // Create volume map for quick lookup
-        Map<String, TickerVolume> volumeMap = volumeDataList.stream()
-                .collect(Collectors.toMap(TickerVolume::getDate, tv -> tv));
-
-        Map<String, List<PatternRecognitionResult>> patternsByDate = new LinkedHashMap<>();
-
-        for (StockData stockData : stockDataList) {
-            String date = stockData.getDate();
-            TickerVolume volumeData = volumeMap.get(date);
-
-            // Get volume if available, empty list otherwise
-            List<TickerVolume.IntervalVolume> filteredVolumes;
-            if (volumeData == null) {
-                log.debug("No volume data for {} on {} - proceeding without volume", symbol, date);
-                filteredVolumes = Collections.emptyList();
-            } else {
-                filteredVolumes = volumeData.getIntervalVolumes().stream()
-                        .filter(iv -> iv.getIntervalMinutes() == intervalMinutes)
-                        .collect(Collectors.toList());
-            }
-
-            // Build candles
-            List<Candle> candles = candleBuilderService.buildCandles(
-                    stockData.getStocksPrices(),
-                    filteredVolumes,
-                    intervalMinutes
-            );
-
-            if (!candles.isEmpty()) {
-                // Scan for patterns
-                List<PatternRecognitionResult> patterns =
-                        patternRecognitionService.scanForPatterns(candles, symbol);
-
-                if (!patterns.isEmpty()) {
-                    patternsByDate.put(date, patterns);
-                }
-            }
-        }
-
-        log.info("Found patterns on {} days for {}", patternsByDate.size(), symbol);
-
-        return patternsByDate;
-    }
-
-    /**
-     * Analyze patterns for all stocks on a specific date
-     *
-     * @param date Date (yyyy-MM-dd)
-     * @param intervalMinutes Candle interval
-     * @return Map of symbol to patterns
-     */
-    public Map<String, List<PatternRecognitionResult>> analyzeAllStocksForDate(
-            String date, int intervalMinutes) {
-
-        log.info("Analyzing patterns for all stocks on {} with {} minute interval", date, intervalMinutes);
-
-        // Fetch all stock data for date
+        // Get all symbols for this date
         List<StockData> stockDataList = stockDataRepository.findByDate(date);
 
-        // Fetch all volume data for date (OPTIONAL)
-        List<TickerVolume> volumeDataList = tickerVolumeRepository.findByDate(date);
+        if (stockDataList.isEmpty()) {
+            log.warn("No stocks found for {}", date);
+            return java.util.Collections.emptyMap();
+        }
 
-        // Create volume map for quick lookup
-        Map<String, TickerVolume> volumeMap = volumeDataList.stream()
-                .collect(Collectors.toMap(TickerVolume::getStockInfo, tv -> tv));
+        List<String> symbols = stockDataList.stream()
+                .map(StockData::getStockInfo)
+                .distinct()
+                .collect(java.util.stream.Collectors.toList());
 
-        Map<String, List<PatternRecognitionResult>> patternsBySymbol = new LinkedHashMap<>();
+        log.info("Analyzing {} symbols", symbols.size());
 
-        for (StockData stockData : stockDataList) {
-            String symbol = stockData.getStockInfo();
-            TickerVolume volumeData = volumeMap.get(symbol);
+        java.util.Map<String, List<PatternRecognitionResult>> results = new java.util.LinkedHashMap<>();
 
-            // Get volume if available, empty list otherwise
-            List<TickerVolume.IntervalVolume> filteredVolumes;
-            if (volumeData == null) {
-                log.debug("No volume data for {} on {} - proceeding without volume", symbol, date);
-                filteredVolumes = Collections.emptyList();
-            } else {
-                filteredVolumes = volumeData.getIntervalVolumes().stream()
-                        .filter(iv -> iv.getIntervalMinutes() == intervalMinutes)
-                        .collect(Collectors.toList());
-            }
-
-            // Build candles
-            List<Candle> candles = candleBuilderService.buildCandles(
-                    stockData.getStocksPrices(),
-                    filteredVolumes,
-                    intervalMinutes
-            );
-
-            if (!candles.isEmpty()) {
-                // Scan for patterns
-                List<PatternRecognitionResult> patterns =
-                        patternRecognitionService.scanForPatterns(candles, symbol);
+        for (String symbol : symbols) {
+            try {
+                List<PatternRecognitionResult> patterns = analyzeStockForDate(symbol, date, intervalMinutes);
 
                 if (!patterns.isEmpty()) {
-                    patternsBySymbol.put(symbol, patterns);
+                    results.put(symbol, patterns);
                 }
+
+            } catch (Exception e) {
+                log.error("Error analyzing {}: {}", symbol, e.getMessage(), e);
             }
         }
 
-        log.info("Found patterns for {} stocks on {}", patternsBySymbol.size(), date);
+        log.info("Found patterns in {}/{} symbols", results.size(), symbols.size());
 
-        return patternsBySymbol;
+        return results;
     }
 
     /**
-     * Get summary statistics for detected patterns
+     * Get summary statistics for a date
      */
-    public PatternSummary getPatternSummary(List<PatternRecognitionResult> patterns) {
-        if (patterns == null || patterns.isEmpty()) {
-            return new PatternSummary(0, 0, 0, 0, Collections.emptyMap());
-        }
+    public AnalysisSummary getAnalysisSummary(String date, int intervalMinutes) {
+        java.util.Map<String, List<PatternRecognitionResult>> allPatterns =
+                analyzeAllStocksForDate(date, intervalMinutes);
 
-        long totalPatterns = patterns.size();
-        long bullishCount = patterns.stream().filter(PatternRecognitionResult::isBullish).count();
-        long bearishCount = patterns.stream().filter(PatternRecognitionResult::isBearish).count();
-        long neutralCount = totalPatterns - bullishCount - bearishCount;
+        int totalPatterns = allPatterns.values().stream()
+                .mapToInt(List::size)
+                .sum();
 
-        Map<CandlePattern, Long> patternCounts = patterns.stream()
-                .collect(Collectors.groupingBy(
+        java.util.Map<CandlePattern, Long> patternCounts = allPatterns.values().stream()
+                .flatMap(List::stream)
+                .collect(java.util.stream.Collectors.groupingBy(
                         PatternRecognitionResult::getPattern,
-                        Collectors.counting()
+                        java.util.stream.Collectors.counting()
                 ));
 
-        return new PatternSummary(totalPatterns, bullishCount, bearishCount, neutralCount, patternCounts);
+        return new AnalysisSummary(
+                date,
+                allPatterns.size(),
+                totalPatterns,
+                patternCounts
+        );
     }
 
     /**
-     * Find the strongest signals (highest confidence patterns)
+     * Analysis summary
      */
-    public List<PatternRecognitionResult> findStrongestSignals(
-            List<PatternRecognitionResult> patterns, int limit) {
+    public static class AnalysisSummary {
+        public final String date;
+        public final int symbolsWithPatterns;
+        public final int totalPatterns;
+        public final java.util.Map<CandlePattern, Long> patternCounts;
 
-        return patterns.stream()
-                .sorted(Comparator.comparing(PatternRecognitionResult::getConfidence).reversed())
-                .limit(limit)
-                .collect(Collectors.toList());
+        public AnalysisSummary(String date, int symbolsWithPatterns, int totalPatterns,
+                               java.util.Map<CandlePattern, Long> patternCounts) {
+            this.date = date;
+            this.symbolsWithPatterns = symbolsWithPatterns;
+            this.totalPatterns = totalPatterns;
+            this.patternCounts = patternCounts;
+        }
     }
-
-    /**
-     * Filter patterns by specific pattern type
-     */
-    public List<PatternRecognitionResult> filterByPattern(
-            List<PatternRecognitionResult> patterns, CandlePattern pattern) {
-
-        return patterns.stream()
-                .filter(p -> p.getPattern() == pattern)
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * Filter patterns by type (bullish/bearish/neutral)
-     */
-    public List<PatternRecognitionResult> filterByType(
-            List<PatternRecognitionResult> patterns, CandlePattern.PatternType type) {
-
-        return patterns.stream()
-                .filter(p -> p.getPattern().getType() == type)
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * Filter patterns by minimum confidence
-     */
-    public List<PatternRecognitionResult> filterByConfidence(
-            List<PatternRecognitionResult> patterns, double minConfidence) {
-
-        return patterns.stream()
-                .filter(p -> p.getConfidence() >= minConfidence)
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * Summary statistics for patterns
-     */
-    public record PatternSummary(
-            long totalPatterns,
-            long bullishPatterns,
-            long bearishPatterns,
-            long neutralPatterns,
-            Map<CandlePattern, Long> patternCounts
-    ) {}
 }

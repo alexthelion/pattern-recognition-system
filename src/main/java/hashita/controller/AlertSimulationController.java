@@ -7,11 +7,8 @@ import hashita.data.entities.DailyAlertEnhanced;
 import hashita.data.entities.StockData;
 import hashita.repository.DailyAlertEnhancedRepository;
 import hashita.repository.StockDataRepository;
-import hashita.service.EntrySignalService;
+import hashita.service.*;
 import hashita.service.EntrySignalService.EntrySignal;
-import hashita.service.PatternAnalysisService;
-import hashita.service.EnhancedEntrySignalService;
-import hashita.service.CandleBuilderService;
 import hashita.repository.TickerVolumeRepository;
 import hashita.data.entities.TickerVolume;
 import lombok.extern.slf4j.Slf4j;
@@ -25,7 +22,9 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Simulation endpoint: Generate bullish alerts from stock data
@@ -49,16 +48,13 @@ public class AlertSimulationController {
     private hashita.service.EnhancedEntrySignalService enhancedEntrySignalService;
 
     @Autowired
-    private CandleBuilderService candleBuilderService;
-
-    @Autowired
-    private TickerVolumeRepository tickerVolumeRepository;
-
-    @Autowired
     private DailyAlertEnhancedRepository dailyAlertEnhancedRepository;
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @Autowired
+    private IBKRCandleService ibkrCandleService;
 
     /**
      * Simulate bullish alerts for a given date
@@ -116,31 +112,32 @@ public class AlertSimulationController {
             List<String> symbols = getSymbolsForDate(targetDate);
             log.info("Found {} symbols with data on {}", symbols.size(), targetDate);
 
-            List<Map<String, Object>> allAlerts = new ArrayList<>();
-            int totalSignals = 0;
+            long startTime = System.currentTimeMillis();
 
-            // Process each symbol
-            for (String symbol : symbols) {
-                try {
-                    log.info("🔍 Processing symbol: {}", symbol);
+            // ✅ PARALLEL PROCESSING - Process all symbols at once!
+            List<Map<String, Object>> allAlerts = symbols.parallelStream()
+                    .flatMap(symbol -> {
+                        try {
+                            log.debug("🔍 Processing symbol: {}", symbol);
 
-                    List<Map<String, Object>> symbolAlerts = generateAlertsForSymbol(
-                            symbol, date, interval, minQuality, maxAlertsPerSymbol, direction
-                    );
+                            List<Map<String, Object>> symbolAlerts = generateAlertsForSymbol(
+                                    symbol, date, interval, minQuality, maxAlertsPerSymbol, direction
+                            );
 
-                    allAlerts.addAll(symbolAlerts);
-                    totalSignals += symbolAlerts.size();
+                            if (!symbolAlerts.isEmpty()) {
+                                log.info("  ✅ {}: {} signals", symbol, symbolAlerts.size());
+                            }
 
-                    if (!symbolAlerts.isEmpty()) {
-                        log.info("  ✅ {}: {} bullish signals", symbol, symbolAlerts.size());
-                    } else {
-                        log.debug("  ⭕ {}: No bullish signals meeting criteria", symbol);
-                    }
+                            return symbolAlerts.stream();
 
-                } catch (Exception e) {
-                    log.error("  ❌ {}: Error - {}", symbol, e.getMessage(), e);  // FIX: Add exception to log
-                }
-            }
+                        } catch (Exception e) {
+                            log.error("  ❌ {}: Error - {}", symbol, e.getMessage());
+                            return Stream.empty();
+                        }
+                    })
+                    .collect(Collectors.toList());
+
+            long duration = System.currentTimeMillis() - startTime;
 
             // Sort by candleTime, then by quality
             allAlerts.sort((a, b) -> {
@@ -160,18 +157,22 @@ public class AlertSimulationController {
                 return Double.compare(qualityB, qualityA);
             });
 
+            log.info("🎉 COMPLETE: {} {} signals from {} symbols in {}ms",
+                    allAlerts.size(), direction, symbols.size(), duration);
+
             return ResponseEntity.ok(Map.of(
                     "date", date,
                     "symbolsProcessed", symbols.size(),
-                    "totalAlerts", totalSignals,
+                    "totalAlerts", allAlerts.size(),
                     "minQuality", minQuality,
                     "maxAlertsPerSymbol", maxAlertsPerSymbol,
+                    "processingTimeMs", duration,  // ✅ NEW
                     "alerts", allAlerts,
-                    "summary", generateSummary(allAlerts)
+                    "direction", direction
             ));
 
         } catch (Exception e) {
-            log.error("Error simulating alerts", e);
+            log.error("Error simulating alerts for {}: {}", direction, e.getMessage(), e);
             return ResponseEntity.internalServerError()
                     .body(Map.of("error", e.getMessage()));
         }
@@ -193,8 +194,8 @@ public class AlertSimulationController {
             return Collections.emptyList();
         }
 
-        // Get ALL candles for enhanced filtering (trend + ADX)
-        List<Candle> allCandles = getCandlesForDate(symbol, date, interval);
+        // Get ALL candles for the day (will filter per pattern)
+        List<Candle> allCandles = ibkrCandleService.getCandlesFromCacheOnly(symbol, date, interval);
 
         if (allCandles.isEmpty()) {
             log.warn("    No candles found for {}, skipping enhanced filters", symbol);
@@ -209,9 +210,21 @@ public class AlertSimulationController {
                     if (baseSignal == null) {
                         return null;
                     }
-                    // Apply enhanced filters (trend + ADX)
+
+                    // CRITICAL: Filter candles to prevent look-ahead bias
+                    // Only use candles UP TO (and including) the pattern's timestamp
+                    List<Candle> candlesUpToPattern = allCandles.stream()
+                            .filter(c -> !c.getTimestamp().isAfter(pattern.getTimestamp()))
+                            .collect(Collectors.toList());
+
+                    if (candlesUpToPattern.isEmpty()) {
+                        log.warn("No historical candles for pattern at {}", pattern.getTimestamp());
+                        return null;
+                    }
+
+                    // Apply enhanced filters with ONLY past data
                     return enhancedEntrySignalService.evaluateWithFilters(
-                            pattern, allCandles, baseSignal
+                            pattern, candlesUpToPattern, baseSignal
                     );
                 })
                 .filter(s -> s != null)
@@ -226,7 +239,7 @@ public class AlertSimulationController {
                     return matches;
                 })
                 .filter(s -> s.getSignalQuality() >= minQuality)
-                .sorted((a, b) -> Double.compare(b.getSignalQuality(), a.getSignalQuality()))
+                .sorted(Comparator.comparing(EntrySignal::getTimestamp))
                 .limit(maxAlerts)
                 .collect(Collectors.toList());
 
@@ -566,6 +579,8 @@ public class AlertSimulationController {
             @RequestParam(defaultValue = "75") int minQuality,
             @RequestParam(defaultValue = "10") int maxAlertsPerSymbol) {
 
+        long startTime = System.currentTimeMillis();
+
         try {
             log.info("🗄️ Persisting alerts for date: {}", date);
 
@@ -587,12 +602,19 @@ public class AlertSimulationController {
 
             log.info("Generated {} alerts to persist", allAlertMaps.size());
 
+            // Delete existing alerts for this date
+            long deletedCount = dailyAlertEnhancedRepository.countByDate(date);
+            if (deletedCount > 0) {
+                dailyAlertEnhancedRepository.deleteByDate(date);
+                log.info("Deleted {} existing alerts for {}", deletedCount, date);
+            }
+
             // Convert Maps to DailyAlertEnhanced entities
             List<DailyAlertEnhanced> alertEntities = allAlertMaps.stream()
                     .map(this::mapToEntity)
                     .collect(Collectors.toList());
 
-            // Step 4: Save alerts one by one, ignoring duplicates
+            // Save alerts one by one, ignoring duplicates
             int savedCount = 0;
             int skippedCount = 0;
 
@@ -613,13 +635,20 @@ public class AlertSimulationController {
             log.info("✅ Saved {} new alerts for {} (skipped {} duplicates)",
                     savedCount, date, skippedCount);
 
+            long executionTimeMs = System.currentTimeMillis() - startTime;
+            long executionTimeSec = executionTimeMs / 1000;
+
+            log.info("⏱️ Execution time: {}s ({}ms)", executionTimeSec, executionTimeMs);
+
             return ResponseEntity.ok(Map.of(
                     "success", true,
                     "date", date,
                     "savedCount", savedCount,
                     "skippedCount", skippedCount,
-                    "message", String.format("Successfully persisted %d alerts for %s (skipped %d duplicates)",
-                            savedCount, date, skippedCount)
+                    "executionTimeMs", executionTimeMs,
+                    "executionTimeSec", executionTimeSec,
+                    "message", String.format("Successfully persisted %d alerts for %s (skipped %d duplicates) in %ds",
+                            savedCount, date, skippedCount, executionTimeSec)
             ));
 
         } catch (Exception e) {
@@ -653,6 +682,12 @@ public class AlertSimulationController {
         @SuppressWarnings("unchecked")
         Map<String, Object> fullTickerData = (Map<String, Object>) alertMap.get("tickerData");
 
+        // Set signalQuality as separate field
+        Object qualityObj = fullTickerData.get("signalQuality");
+        if (qualityObj instanceof Number) {
+            alert.setSignalQuality(((Number) qualityObj).doubleValue());
+        }
+
         // Create simplified tickerData for MongoDB (matching StockInfoPayload)
         Map<String, Object> simplifiedTickerData = new LinkedHashMap<>();
         simplifiedTickerData.put("symbol", fullTickerData.get("symbol"));
@@ -676,43 +711,189 @@ public class AlertSimulationController {
     }
 
     /**
-     * Helper method to get all candles for a date (for enhanced filtering)
+     * Persist simulated alerts for a date range to MongoDB - BULLISH ONLY
+     *
+     * Generates bullish alerts from stock data for multiple dates and saves to daily_alerts_enhanced collection.
+     * Duplicates are skipped (based on unique index on tickerData).
+     *
+     * @param startDate Start date in yyyy-MM-dd format (e.g., "2025-10-01")
+     * @param endDate End date in yyyy-MM-dd format (e.g., "2025-10-31")
+     * @param interval Candle interval in minutes (default: 5)
+     * @param minQuality Minimum signal quality 0-100 (default: 75)
+     * @param maxAlertsPerSymbol Max alerts per symbol per day (default: 10)
+     * @return Save results with counts per date
+     *
+     * Example request:
+     * POST /api/simulate/alerts/persist/range?startDate=2025-10-01&endDate=2025-10-31&minQuality=90
+     *
+     * Example response:
+     * {
+     *   "success": true,
+     *   "startDate": "2025-10-01",
+     *   "endDate": "2025-10-31",
+     *   "datesProcessed": 31,
+     *   "totalSaved": 487,
+     *   "totalSkipped": 23,
+     *   "results": [
+     *     {
+     *       "date": "2025-10-01",
+     *       "savedCount": 15,
+     *       "skippedCount": 1
+     *     }
+     *   ]
+     * }
      */
-    private List<Candle> getCandlesForDate(String symbol, String date, int intervalMinutes) {
+    @PostMapping("/alerts/persist/range")
+    @Transactional
+    public ResponseEntity<?> persistAlertsDateRange(
+            @RequestParam String startDate,
+            @RequestParam String endDate,
+            @RequestParam(defaultValue = "5") int interval,
+            @RequestParam(defaultValue = "75") int minQuality,
+            @RequestParam(defaultValue = "10") int maxAlertsPerSymbol) {
+
+        long startTime = System.currentTimeMillis();
+
         try {
-            // Get stock data
-            StockData stockData = stockDataRepository
-                    .findByStockInfoAndDate(symbol, date)
-                    .orElse(null);
+            LocalDate start = LocalDate.parse(startDate);
+            LocalDate end = LocalDate.parse(endDate);
 
-            if (stockData == null) {
-                return Collections.emptyList();
+            if (start.isAfter(end)) {
+                return ResponseEntity.badRequest()
+                        .body(Map.of(
+                                "success", false,
+                                "error", "startDate must be before or equal to endDate"
+                        ));
             }
 
-            // Get volume data (optional)
-            List<TickerVolume.IntervalVolume> filteredVolumes;
-            TickerVolume volumeData = tickerVolumeRepository
-                    .findByStockInfoAndDate(symbol, date)
-                    .orElse(null);
+            log.info("🗄️ Persisting alerts for date range: {} to {}", startDate, endDate);
 
-            if (volumeData == null) {
-                filteredVolumes = Collections.emptyList();
-            } else {
-                filteredVolumes = volumeData.getIntervalVolumes().stream()
-                        .filter(iv -> iv.getIntervalMinutes() == intervalMinutes)
-                        .collect(Collectors.toList());
+            List<Map<String, Object>> dateResults = Collections.synchronizedList(new ArrayList<>());
+            AtomicInteger totalSaved = new AtomicInteger(0);
+            AtomicInteger totalSkipped = new AtomicInteger(0);
+            AtomicInteger datesProcessed = new AtomicInteger(0);
+
+            // Generate list of dates to process
+            List<LocalDate> dates = new ArrayList<>();
+            LocalDate currentDate = start;
+            while (!currentDate.isAfter(end)) {
+                dates.add(currentDate);
+                currentDate = currentDate.plusDays(1);
             }
 
-            // Build candles
-            return candleBuilderService.buildCandles(
-                    stockData.getStocksPrices(),
-                    filteredVolumes,
-                    intervalMinutes
-            );
+            log.info("Processing {} dates in parallel...", dates.size());
+
+            // Process dates in parallel
+            dates.parallelStream().forEach(date -> {
+                String dateStr = date.toString();
+                log.info("📅 Processing date: {}", dateStr);
+
+                try {
+                    // Get symbols for this date
+                    List<String> symbols = getSymbolsForDate(date);
+
+                    if (symbols.isEmpty()) {
+                        log.warn("  ⚠️ No symbols found for {}", dateStr);
+                        dateResults.add(Map.of(
+                                "date", dateStr,
+                                "savedCount", 0,
+                                "skippedCount", 0,
+                                "error", "No symbols found"
+                        ));
+                        return;
+                    }
+
+                    // Generate alerts for this date
+                    List<Map<String, Object>> allAlertMaps = new ArrayList<>();
+                    for (String symbol : symbols) {
+                        try {
+                            List<Map<String, Object>> symbolAlerts = generateAlertsForSymbol(
+                                    symbol, dateStr, interval, minQuality, maxAlertsPerSymbol, "LONG"
+                            );
+                            allAlertMaps.addAll(symbolAlerts);
+                        } catch (Exception e) {
+                            log.warn("  ⚠️ {}: Error - {}", symbol, e.getMessage());
+                        }
+                    }
+
+                    // Delete existing alerts for this date
+                    long deletedCount = dailyAlertEnhancedRepository.countByDate(dateStr);
+                    if (deletedCount > 0) {
+                        dailyAlertEnhancedRepository.deleteByDate(dateStr);
+                        log.info("  Deleted {} existing alerts for {}", deletedCount, dateStr);
+                    }
+
+                    // Convert and save alerts
+                    List<DailyAlertEnhanced> alertEntities = allAlertMaps.stream()
+                            .map(this::mapToEntity)
+                            .collect(Collectors.toList());
+
+                    int savedCount = 0;
+                    int skippedCount = 0;
+
+                    for (DailyAlertEnhanced alert : alertEntities) {
+                        try {
+                            dailyAlertEnhancedRepository.save(alert);
+                            savedCount++;
+                        } catch (org.springframework.dao.DuplicateKeyException e) {
+                            skippedCount++;
+                            log.debug("Skipped duplicate alert: {}", alert.getTickerData());
+                        } catch (Exception e) {
+                            log.warn("Error saving alert: {}", e.getMessage());
+                            skippedCount++;
+                        }
+                    }
+
+                    log.info("  ✅ Saved {} alerts for {} (skipped {})", savedCount, dateStr, skippedCount);
+
+                    dateResults.add(Map.of(
+                            "date", dateStr,
+                            "savedCount", savedCount,
+                            "skippedCount", skippedCount
+                    ));
+
+                    totalSaved.addAndGet(savedCount);
+                    totalSkipped.addAndGet(skippedCount);
+                    datesProcessed.incrementAndGet();
+
+                } catch (Exception e) {
+                    log.error("  ❌ Error processing date {}: {}", dateStr, e.getMessage());
+                    dateResults.add(Map.of(
+                            "date", dateStr,
+                            "savedCount", 0,
+                            "skippedCount", 0,
+                            "error", e.getMessage()
+                    ));
+                }
+            });
+
+            long executionTimeMs = System.currentTimeMillis() - startTime;
+            long executionTimeSec = executionTimeMs / 1000;
+
+            log.info("✅ Completed date range: {} dates, {} saved, {} skipped in {}s",
+                    datesProcessed.get(), totalSaved.get(), totalSkipped.get(), executionTimeSec);
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "startDate", startDate,
+                    "endDate", endDate,
+                    "datesProcessed", datesProcessed.get(),
+                    "totalSaved", totalSaved.get(),
+                    "totalSkipped", totalSkipped.get(),
+                    "executionTimeMs", executionTimeMs,
+                    "executionTimeSec", executionTimeSec,
+                    "results", dateResults,
+                    "message", String.format("Successfully processed %d dates: %d saved, %d skipped in %ds",
+                            datesProcessed.get(), totalSaved.get(), totalSkipped.get(), executionTimeSec)
+            ));
 
         } catch (Exception e) {
-            log.error("Error getting candles for {}", symbol, e);
-            return Collections.emptyList();
+            log.error("Error persisting date range", e);
+            return ResponseEntity.internalServerError()
+                    .body(Map.of(
+                            "success", false,
+                            "error", e.getMessage()
+                    ));
         }
     }
 }

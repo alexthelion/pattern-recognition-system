@@ -1,0 +1,9 @@
+ibkr:
+  host: 127.0.0.1
+  port: 4001        # adjust for your TWS/Gateway
+  clientId: 1001
+  marketDataType: 1 # 1=real-time, 3=delayed
+  defaultStockExchange: SMART
+  defaultStockCurrency: USD
+  defaultCryptoExchange: PAXOS
+  defaultCryptoCurrency: USD

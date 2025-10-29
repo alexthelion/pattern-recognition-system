@@ -55,6 +55,11 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <groupId>com.ib</groupId>
+            <artifactId>ibapi</artifactId>
+            <version>10.30</version>
+        </dependency>
     </dependencies>
 
     <build>

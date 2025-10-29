@@ -32,4 +32,6 @@ public class DailyAlertEnhanced {
 
     @Indexed(unique = true)
     private String tickerData;
+
+    private double signalQuality;
 }

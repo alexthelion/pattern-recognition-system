@@ -8,19 +8,18 @@ import hashita.service.EntrySignalService;
 import hashita.service.EntrySignalService.EntrySignal;
 import hashita.service.EnhancedEntrySignalService;
 import hashita.service.PatternAnalysisService;
+import hashita.service.IBKRCandleService;  // ✅ NEW
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.time.LocalDate;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.stream.Collectors;
 
 /**
  * DEBUG: Test simulation to see what's happening
+ * ✅ UPDATED: Now uses IBKR candles with 5-day context
  */
 @RestController
 @RequestMapping("/api/simulate/debug")
@@ -39,6 +38,9 @@ public class AlertSimulationDebugController {
     @Autowired
     private EnhancedEntrySignalService enhancedEntrySignalService;
 
+    @Autowired
+    private IBKRCandleService ibkrCandleService;  // ✅ NEW
+
     /**
      * Debug: Check what symbols are found and what patterns they have
      */
@@ -52,8 +54,7 @@ public class AlertSimulationDebugController {
             Map<String, Object> debug = new LinkedHashMap<>();
 
             // Get all symbols for date
-            String dateStr = date;
-            List<StockData> data = stockDataRepository.findByDate(dateStr);
+            List<StockData> data = stockDataRepository.findByDate(date);
             List<String> allSymbols = data.stream()
                     .map(StockData::getStockInfo)
                     .distinct()
@@ -70,7 +71,6 @@ public class AlertSimulationDebugController {
 
                 log.info("🔍 Testing symbol: {}", testSymbol);
 
-                // Try to get patterns
                 try {
                     List<PatternRecognitionResult> patterns =
                             patternAnalysisService.analyzeStockForDate(testSymbol, date, interval);
@@ -82,17 +82,25 @@ public class AlertSimulationDebugController {
                                 .map(p -> p.getPattern().name())
                                 .collect(Collectors.toList()));
 
-                        // Get candles
-                        List<Candle> candles = patterns.get(0).getCandles();
-                        symbolAnalysis.put("candlesAvailable", candles != null ? candles.size() : 0);
+                        // ✅ NEW: Get candles with 5-day context
+                        List<Candle> candles = ibkrCandleService.getCandlesWithContext(
+                                testSymbol, date, interval);
+
+                        symbolAnalysis.put("candlesAvailable", candles.size());
+                        symbolAnalysis.put("candleSource", "IBKR (5-day context)");
 
                         // Try to generate signals
                         List<EntrySignal> signals = new ArrayList<>();
                         for (PatternRecognitionResult pattern : patterns) {
                             EntrySignal baseSignal = entrySignalService.evaluatePattern(pattern);
                             if (baseSignal != null) {
+                                // Filter candles up to pattern time
+                                List<Candle> candlesUpToPattern = candles.stream()
+                                        .filter(c -> !c.getTimestamp().isAfter(pattern.getTimestamp()))
+                                        .collect(Collectors.toList());
+
                                 EntrySignal enhancedSignal = enhancedEntrySignalService.evaluateWithFilters(
-                                        pattern, candles, baseSignal);
+                                        pattern, candlesUpToPattern, baseSignal);
                                 if (enhancedSignal != null) {
                                     signals.add(enhancedSignal);
                                 }
@@ -111,7 +119,7 @@ public class AlertSimulationDebugController {
 
                         // Filter for BULLISH only
                         long bullishCount = signals.stream()
-                                .filter(s -> s.getDirection().equals("LONG"))
+                                .filter(s -> "LONG".equals(s.getDirection().name()))
                                 .count();
                         symbolAnalysis.put("bullishSignals", bullishCount);
 
@@ -175,8 +183,7 @@ public class AlertSimulationDebugController {
                                 "confidence", p.getConfidence(),
                                 "timestamp", p.getTimestamp().toString(),
                                 "price", p.getPriceAtDetection(),
-                                "hasVolume", p.isHasVolumeConfirmation(),
-                                "candleCount", p.getCandles() != null ? p.getCandles().size() : 0
+                                "hasVolume", p.isHasVolumeConfirmation()
                         ))
                         .collect(Collectors.toList()));
             }
@@ -206,7 +213,7 @@ public class AlertSimulationDebugController {
             result.put("date", date);
 
             // Step 1: Get patterns
-            log.info("📍 Step 1: Getting patterns for {}", symbol);
+            log.info("🔍 Step 1: Getting patterns for {}", symbol);
             List<PatternRecognitionResult> patterns =
                     patternAnalysisService.analyzeStockForDate(symbol, date, interval);
             result.put("step1_patterns", patterns.size());
@@ -216,18 +223,19 @@ public class AlertSimulationDebugController {
                 return ResponseEntity.ok(result);
             }
 
-            // Step 2: Get candles
-            log.info("📍 Step 2: Getting candles");
-            List<Candle> candles = patterns.get(0).getCandles();
-            result.put("step2_candles", candles != null ? candles.size() : 0);
+            // Step 2: ✅ NEW: Get candles with 5-day context
+            log.info("🔍 Step 2: Getting candles with 5-day context");
+            List<Candle> candles = ibkrCandleService.getCandlesWithContext(symbol, date, interval);
+            result.put("step2_candles", candles.size());
+            result.put("step2_candleSource", "IBKR (5-day context)");
 
-            if (candles == null || candles.size() < 50) {
-                result.put("reason", "Not enough candles (need 50+, got " + (candles != null ? candles.size() : 0) + ")");
+            if (candles.size() < 50) {
+                result.put("reason", "Not enough candles (need 50+, got " + candles.size() + ")");
                 return ResponseEntity.ok(result);
             }
 
             // Step 3: Generate base signals
-            log.info("📍 Step 3: Generating base signals");
+            log.info("🔍 Step 3: Generating base signals");
             List<EntrySignal> baseSignals = new ArrayList<>();
             for (PatternRecognitionResult pattern : patterns) {
                 EntrySignal signal = entrySignalService.evaluatePattern(pattern);
@@ -243,11 +251,17 @@ public class AlertSimulationDebugController {
             }
 
             // Step 4: Apply enhanced filters
-            log.info("📍 Step 4: Applying enhanced filters");
+            log.info("🔍 Step 4: Applying enhanced filters");
             List<EntrySignal> enhancedSignals = new ArrayList<>();
-            for (int i = 0; i < patterns.size(); i++) {
+            for (int i = 0; i < patterns.size() && i < baseSignals.size(); i++) {
+                // Filter candles up to pattern time
+                int finalI = i;
+                List<Candle> candlesUpToPattern = candles.stream()
+                        .filter(c -> !c.getTimestamp().isAfter(patterns.get(finalI).getTimestamp()))
+                        .collect(Collectors.toList());
+
                 EntrySignal enhanced = enhancedEntrySignalService.evaluateWithFilters(
-                        patterns.get(i), candles, baseSignals.get(i));
+                        patterns.get(i), candlesUpToPattern, baseSignals.get(i));
                 if (enhanced != null) {
                     enhancedSignals.add(enhanced);
                 }
@@ -255,14 +269,14 @@ public class AlertSimulationDebugController {
             result.put("step4_enhancedSignals", enhancedSignals.size());
 
             // Step 5: Filter BULLISH only
-            log.info("📍 Step 5: Filtering for BULLISH");
+            log.info("🔍 Step 5: Filtering for BULLISH");
             List<EntrySignal> bullishSignals = enhancedSignals.stream()
-                    .filter(s -> s.getDirection().equals("LONG"))
+                    .filter(s -> "LONG".equals(s.getDirection().name()))
                     .collect(Collectors.toList());
             result.put("step5_bullishSignals", bullishSignals.size());
 
             // Step 6: Filter by quality
-            log.info("📍 Step 6: Filtering by quality >= {}", minQuality);
+            log.info("🔍 Step 6: Filtering by quality >= {}", minQuality);
             List<EntrySignal> qualitySignals = bullishSignals.stream()
                     .filter(s -> s.getSignalQuality() >= minQuality)
                     .collect(Collectors.toList());

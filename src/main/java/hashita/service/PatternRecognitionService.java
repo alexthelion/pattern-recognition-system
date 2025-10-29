@@ -287,6 +287,17 @@ public class PatternRecognitionService {
      */
     private PatternRecognitionResult detectBullishEngulfing(Candle prev, Candle curr,
                                                             String symbol, double avgVolume) {
+        // DEBUG: Log candle details
+        log.debug("🔍 Checking BULLISH_ENGULFING: prev[{}] open={}, close={}, bearish={} | curr[{}] open={}, close={}, bullish={}",
+                prev.getTimestamp().toString().substring(11, 16),
+                String.format("%.2f", prev.getOpen()),
+                String.format("%.2f", prev.getClose()),
+                prev.isBearish(),
+                curr.getTimestamp().toString().substring(11, 16),
+                String.format("%.2f", curr.getOpen()),
+                String.format("%.2f", curr.getClose()),
+                curr.isBullish());
+
         // Previous candle must be bearish, current must be bullish
         if (!prev.isBearish() || !curr.isBullish()) {
             return null;
@@ -295,12 +306,31 @@ public class PatternRecognitionService {
         // Current candle body must completely engulf previous candle body
         boolean engulfs = curr.getOpen() <= prev.getClose() && curr.getClose() >= prev.getOpen();
 
-        // Current candle should have significant body
+        // Current candle should have significant body (percentage of range)
         boolean hasSignificantBody = curr.getBodyPercentage() > 50;
 
-        if (engulfs && hasSignificantBody) {
-            boolean volumeConfirmation = curr.getVolume() > avgVolume * 1.2;
+        // ✅ FIX: Also check ABSOLUTE body size (minimum 5% move for engulfing)
+        // Engulfing patterns should show strong momentum, not tiny moves
+        double bodySize = Math.abs(curr.getClose() - curr.getOpen());
+        double bodyPercent = (bodySize / curr.getOpen()) * 100;
+        boolean hasMinimumSize = bodyPercent >= 5.0;  // At least 5% move for engulfing
+
+        log.debug("  Body size: {}, percent: {:.2f}%, significant: {}, minimum: {}",
+                String.format("%.3f", bodySize),
+                bodyPercent,
+                hasSignificantBody,
+                hasMinimumSize);
+
+        if (engulfs && hasSignificantBody && hasMinimumSize) {
+            boolean volumeConfirmation = hasSignificantVolumeConfirmation(curr.getVolume(), avgVolume);
             double confidence = calculateConfidence(80, curr.getVolume(), avgVolume);
+
+            log.info("✅ BULLISH_ENGULFING detected at {}: prev[bearish {}→{}] curr[bullish {}→{}]",
+                    curr.getTimestamp(),
+                    String.format("%.2f", prev.getOpen()),
+                    String.format("%.2f", prev.getClose()),
+                    String.format("%.2f", curr.getOpen()),
+                    String.format("%.2f", curr.getClose()));
 
             return PatternRecognitionResult.builder()
                     .pattern(CandlePattern.BULLISH_ENGULFING)
@@ -340,7 +370,7 @@ public class PatternRecognitionService {
         boolean notEngulfing = curr.getClose() < prev.getOpen();
 
         if (gapsDown && closesAboveMidpoint && notEngulfing) {
-            boolean volumeConfirmation = curr.getVolume() > avgVolume * 1.2;
+            boolean volumeConfirmation = hasSignificantVolumeConfirmation(curr.getVolume(), avgVolume);
             double confidence = calculateConfidence(75, curr.getVolume(), avgVolume);
 
             return PatternRecognitionResult.builder()
@@ -382,7 +412,7 @@ public class PatternRecognitionService {
         boolean closesIntoFirst = third.getClose() > firstMidpoint;
 
         if (hasSmallBody && gapsDown && thirdIsBullish && hasLargeBody && closesIntoFirst) {
-            boolean volumeConfirmation = third.getVolume() > avgVolume * 1.3;
+            boolean volumeConfirmation = hasSignificantVolumeConfirmation(third.getVolume(), avgVolume);
             double confidence = calculateConfidence(85, third.getVolume(), avgVolume);
 
             return PatternRecognitionResult.builder()
@@ -435,7 +465,7 @@ public class PatternRecognitionService {
 
         if (allHaveLargeBodies && progressiveCloses && properOpens && smallShadows) {
             double avgVol = (first.getVolume() + second.getVolume() + third.getVolume()) / 3;
-            boolean volumeConfirmation = avgVol > avgVolume * 1.2;
+            boolean volumeConfirmation = hasSignificantVolumeConfirmation(avgVol, avgVolume);
             double confidence = calculateConfidence(80, avgVol, avgVolume);  // Slightly lower confidence
 
             return PatternRecognitionResult.builder()
@@ -625,8 +655,13 @@ public class PatternRecognitionService {
         boolean engulfs = curr.getOpen() >= prev.getClose() && curr.getClose() <= prev.getOpen();
         boolean hasSignificantBody = curr.getBodyPercentage() > 50;
 
-        if (engulfs && hasSignificantBody) {
-            boolean volumeConfirmation = curr.getVolume() > avgVolume * 1.2;
+        // ✅ FIX: Also check ABSOLUTE body size (minimum 5% move for engulfing)
+        double bodySize = Math.abs(curr.getClose() - curr.getOpen());
+        double bodyPercent = (bodySize / curr.getOpen()) * 100;
+        boolean hasMinimumSize = bodyPercent >= 5.0;
+
+        if (engulfs && hasSignificantBody && hasMinimumSize) {
+            boolean volumeConfirmation = hasSignificantVolumeConfirmation(curr.getVolume(), avgVolume);
             double confidence = calculateConfidence(80, curr.getVolume(), avgVolume);
 
             return PatternRecognitionResult.builder()
@@ -662,7 +697,7 @@ public class PatternRecognitionService {
         boolean notEngulfing = curr.getClose() > prev.getOpen();
 
         if (gapsUp && closesBelowMidpoint && notEngulfing) {
-            boolean volumeConfirmation = curr.getVolume() > avgVolume * 1.2;
+            boolean volumeConfirmation = hasSignificantVolumeConfirmation(curr.getVolume(), avgVolume);
             double confidence = calculateConfidence(75, curr.getVolume(), avgVolume);
 
             return PatternRecognitionResult.builder()
@@ -701,7 +736,7 @@ public class PatternRecognitionService {
         boolean closesIntoFirst = third.getClose() < firstMidpoint;
 
         if (hasSmallBody && gapsUp && thirdIsBearish && hasLargeBody && closesIntoFirst) {
-            boolean volumeConfirmation = third.getVolume() > avgVolume * 1.3;
+            boolean volumeConfirmation = hasSignificantVolumeConfirmation(third.getVolume(), avgVolume);
             double confidence = calculateConfidence(85, third.getVolume(), avgVolume);
 
             return PatternRecognitionResult.builder()
@@ -752,7 +787,7 @@ public class PatternRecognitionService {
 
         if (allHaveLargeBodies && progressiveCloses && properOpens && smallShadows) {
             double avgVol = (first.getVolume() + second.getVolume() + third.getVolume()) / 3;
-            boolean volumeConfirmation = avgVol > avgVolume * 1.2;
+            boolean volumeConfirmation = hasSignificantVolumeConfirmation(avgVol, avgVolume);
             double confidence = calculateConfidence(80, avgVol, avgVolume);
 
             return PatternRecognitionResult.builder()
@@ -933,10 +968,49 @@ public class PatternRecognitionService {
             return 0.0;
         }
 
+        // ✅ FIX: Exclude candles with zero/missing volume from average calculation
         return candles.stream()
                 .mapToDouble(Candle::getVolume)
+                .filter(v -> v > 0)  // Ignore zero volumes
                 .average()
-                .orElse(0.0);
+                .orElse(0.0);  // Return 0 if no volume data at all
+    }
+
+    /**
+     * ✅ FIX: Check if volume confirmation is SIGNIFICANT
+     *
+     * Requirements:
+     * 1. Average volume must exist (> 0)
+     * 2. Current volume must be 50% above average
+     * 3. Current volume must meet minimum absolute threshold (1000)
+     *
+     * IMPORTANT: Returns FALSE (not true) when no volume data exists
+     * This means patterns can still be detected without volume,
+     * but they won't get the volume confirmation bonus.
+     *
+     * This prevents false positives when:
+     * - Volume data is missing for the day
+     * - Volume is present but insignificant
+     * - Stock has very low average volume
+     */
+    private boolean hasSignificantVolumeConfirmation(double currentVolume, double avgVolume) {
+        // If no volume data at all, return false (pattern still valid, just no volume bonus)
+        if (avgVolume == 0 || currentVolume == 0) {
+            log.debug("❌ No volume data: avgVolume={}, currentVolume={}", avgVolume, currentVolume);
+            return false;
+        }
+
+        // Require: 50% above average AND minimum 1000 volume
+        boolean result = currentVolume > avgVolume * 1.5 && currentVolume > 1000;
+
+        // DEBUG: Log volume confirmation decision
+        log.info("📊 Volume Check: current={}, avg={}, threshold={}, min=1000, result={}",
+                String.format("%.0f", currentVolume),
+                String.format("%.0f", avgVolume),
+                String.format("%.0f", avgVolume * 1.5),
+                result);
+
+        return result;
     }
 
     /**
