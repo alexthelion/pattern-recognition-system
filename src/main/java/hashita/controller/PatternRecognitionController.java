@@ -46,7 +46,42 @@ public class PatternRecognitionController {
     private TickerVolumeRepository tickerVolumeRepository;
 
     /**
-     * Get entry signals with ENHANCED filters (trend + ADX)
+     * Get entry signals with ENHANCED filters (trend + ADX) - BULLISH ONLY
+     *
+     * Filters:
+     * - Only LONG/bullish signals
+     * - Trend alignment
+     * - ADX strength
+     * - Minimum quality threshold
+     *
+     * @param symbol Stock symbol (e.g., "BITF")
+     * @param date Date in yyyy-MM-dd format (e.g., "2025-10-06")
+     * @param interval Candle interval in minutes (default: 5)
+     * @param minQuality Minimum signal quality 0-100 (default: 75)
+     * @return List of bullish entry signals
+     *
+     * Example request:
+     * GET /api/signals/entry-enhanced?symbol=BITF&date=2025-10-06&interval=5&minQuality=75
+     *
+     * Example response:
+     * {
+     *   "symbol": "BITF",
+     *   "date": "2025-10-06",
+     *   "intervalMinutes": 5,
+     *   "totalPatterns": 34,
+     *   "count": 2,
+     *   "signals": [
+     *     {
+     *       "symbol": "BITF",
+     *       "pattern": "BULLISH_ENGULFING",
+     *       "direction": "LONG",
+     *       "entryPrice": 3.46,
+     *       "stopLoss": 3.35,
+     *       "target": 3.76,
+     *       "signalQuality": 95.5
+     *     }
+     *   ]
+     * }
      */
     @GetMapping("/signals/entry-enhanced")
     public ResponseEntity<?> getEnhancedEntrySignals(
@@ -103,6 +138,7 @@ public class PatternRecognitionController {
                     })
                     .filter(s -> s != null)
                     .filter(s -> s.getSignalQuality() >= minQuality)
+                    .filter(s -> "LONG".equals(s.getDirection().name()))
                     .sorted(Comparator.comparing(EntrySignal::getTimestamp)
                             .thenComparing(Comparator.comparingDouble(EntrySignal::getSignalQuality).reversed()))
                     .collect(Collectors.toList());
