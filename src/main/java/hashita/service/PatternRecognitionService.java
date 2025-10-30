@@ -18,7 +18,7 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class PatternRecognitionService {
 
-    private final CandleBuilderService candleBuilderService;
+    private final ChartPatternDetector chartPatternDetector;
 
     // Tolerance for comparing prices (0.5%)
     private static final double PRICE_TOLERANCE = 0.005;
@@ -41,9 +41,15 @@ public class PatternRecognitionService {
 
         List<PatternRecognitionResult> results = new ArrayList<>();
 
-        // Calculate context metrics
-        double avgBody = candleBuilderService.calculateAverageCandleBody(candles);
-        double avgRange = candleBuilderService.calculateAverageCandleRange(candles);
+        // ✅ ADD THIS: Detect chart patterns FIRST (needs 20+ candles)
+        if (candles.size() >= 20) {
+            log.debug("Checking for chart patterns in {} candles", candles.size());
+            results.addAll(detectChartPatterns(candles, symbol));
+        }
+
+        // ✅ CHANGE THIS: Calculate metrics directly (no CandleBuilderService)
+        double avgBody = calculateAverageCandleBody(candles);   // Direct method
+        double avgRange = calculateAverageCandleRange(candles); // Direct method
         double avgVolume = calculateAverageVolume(candles);
 
         // Scan from oldest to newest, but need at least 3 candles for lookback
@@ -61,6 +67,7 @@ public class PatternRecognitionService {
 
         return results;
     }
+
 
     /**
      * Detect single candle patterns
@@ -83,42 +90,42 @@ public class PatternRecognitionService {
 
         // Hammer (appears after DOWNTREND)
         if (isInDowntrend) {
-            PatternRecognitionResult hammer = detectHammer(current, symbol, avgRange);
+            PatternRecognitionResult hammer = detectHammer(current, symbol, avgVolume);
             if (hammer != null) results.add(hammer);
         }
 
         // Hanging Man (appears after UPTREND) - same shape as hammer but different context!
         if (isInUptrend) {
-            PatternRecognitionResult hangingMan = detectHangingMan(current, symbol, avgRange);
+            PatternRecognitionResult hangingMan = detectHangingMan(current, symbol, avgVolume);
             if (hangingMan != null) results.add(hangingMan);
         }
 
         // Inverted Hammer (appears after DOWNTREND)
         if (isInDowntrend) {
-            PatternRecognitionResult invertedHammer = detectInvertedHammer(current, symbol, avgRange);
+            PatternRecognitionResult invertedHammer = detectInvertedHammer(current, symbol, avgVolume);
             if (invertedHammer != null) results.add(invertedHammer);
         }
 
         // Shooting Star (appears after UPTREND) - same shape as inverted hammer!
         if (isInUptrend) {
-            PatternRecognitionResult shootingStar = detectShootingStar(current, symbol, avgRange);
+            PatternRecognitionResult shootingStar = detectShootingStar(current, symbol, avgVolume);
             if (shootingStar != null) results.add(shootingStar);
         }
 
         // Doji (context-independent)
-        PatternRecognitionResult doji = detectDoji(current, symbol);
+        PatternRecognitionResult doji = detectDoji(current, symbol, avgVolume);
         if (doji != null) results.add(doji);
 
         // Dragonfly Doji (context-independent)
-        PatternRecognitionResult dragonflyDoji = detectDragonflyDoji(current, symbol);
+        PatternRecognitionResult dragonflyDoji = detectDragonflyDoji(current, symbol, avgVolume);
         if (dragonflyDoji != null) results.add(dragonflyDoji);
 
         // Gravestone Doji (context-independent)
-        PatternRecognitionResult gravestoneDoji = detectGravestoneDoji(current, symbol);
+        PatternRecognitionResult gravestoneDoji = detectGravestoneDoji(current, symbol, avgVolume);
         if (gravestoneDoji != null) results.add(gravestoneDoji);
 
         // Spinning Top
-        PatternRecognitionResult spinningTop = detectSpinningTop(current, symbol);
+        PatternRecognitionResult spinningTop = detectSpinningTop(current, symbol, avgVolume);
         if (spinningTop != null) results.add(spinningTop);
 
         return results;
@@ -217,7 +224,7 @@ public class PatternRecognitionService {
      * - Little or no upper shadow
      * - Appears in downtrend (bullish reversal)
      */
-    private PatternRecognitionResult detectHammer(Candle candle, String symbol, double avgRange) {
+    private PatternRecognitionResult detectHammer(Candle candle, String symbol, double avgVolume) {
         double bodySize = candle.getBodySize();
         double lowerShadow = candle.getLowerShadow();
         double upperShadow = candle.getUpperShadow();
@@ -242,7 +249,8 @@ public class PatternRecognitionService {
                     .description("Hammer pattern detected - potential bullish reversal")
                     .priceAtDetection(candle.getClose())
                     .supportLevel(candle.getLow())
-                    .hasVolumeConfirmation(false)
+                    .averageVolume(avgVolume)
+                    .hasVolumeConfirmation(candle.getVolume() > avgVolume * 1.1)
                     .build();
         }
 
@@ -252,7 +260,7 @@ public class PatternRecognitionService {
     /**
      * Detect Inverted Hammer pattern
      */
-    private PatternRecognitionResult detectInvertedHammer(Candle candle, String symbol, double avgRange) {
+    private PatternRecognitionResult detectInvertedHammer(Candle candle, String symbol, double avgVolume) {
         double bodySize = candle.getBodySize();
         double lowerShadow = candle.getLowerShadow();
         double upperShadow = candle.getUpperShadow();
@@ -276,6 +284,8 @@ public class PatternRecognitionService {
                     .priceAtDetection(candle.getClose())
                     .supportLevel(candle.getLow())
                     .resistanceLevel(candle.getHigh())
+                    .averageVolume(avgVolume)
+                    .hasVolumeConfirmation(candle.getVolume() > avgVolume * 1.1)
                     .build();
         }
 
@@ -549,7 +559,7 @@ public class PatternRecognitionService {
     /**
      * Detect Dragonfly Doji pattern
      */
-    private PatternRecognitionResult detectDragonflyDoji(Candle candle, String symbol) {
+    private PatternRecognitionResult detectDragonflyDoji(Candle candle, String symbol, double avgVolume) {
         if (!candle.isDoji()) {
             return null;
         }
@@ -569,6 +579,8 @@ public class PatternRecognitionService {
                     .description("Dragonfly Doji pattern detected - potential bullish reversal")
                     .priceAtDetection(candle.getClose())
                     .supportLevel(candle.getLow())
+                    .averageVolume(avgVolume)
+                    .hasVolumeConfirmation(candle.getVolume() > avgVolume * 1.1)
                     .build();
         }
 
@@ -580,7 +592,7 @@ public class PatternRecognitionService {
     /**
      * Detect Shooting Star pattern
      */
-    private PatternRecognitionResult detectShootingStar(Candle candle, String symbol, double avgRange) {
+    private PatternRecognitionResult detectShootingStar(Candle candle, String symbol, double avgVolume) {
         double bodySize = candle.getBodySize();
         double lowerShadow = candle.getLowerShadow();
         double upperShadow = candle.getUpperShadow();
@@ -603,6 +615,8 @@ public class PatternRecognitionService {
                     .description("Shooting Star pattern detected - potential bearish reversal")
                     .priceAtDetection(candle.getClose())
                     .resistanceLevel(candle.getHigh())
+                    .averageVolume(avgVolume)
+                    .hasVolumeConfirmation(candle.getVolume() > avgVolume * 1.1)
                     .build();
         }
 
@@ -612,7 +626,7 @@ public class PatternRecognitionService {
     /**
      * Detect Hanging Man pattern
      */
-    private PatternRecognitionResult detectHangingMan(Candle candle, String symbol, double avgRange) {
+    private PatternRecognitionResult detectHangingMan(Candle candle, String symbol, double avgVolume) {
         double bodySize = candle.getBodySize();
         double lowerShadow = candle.getLowerShadow();
         double upperShadow = candle.getUpperShadow();
@@ -637,6 +651,8 @@ public class PatternRecognitionService {
                     .priceAtDetection(candle.getClose())
                     .supportLevel(candle.getLow())
                     .resistanceLevel(candle.getHigh())
+                    .averageVolume(avgVolume)
+                    .hasVolumeConfirmation(candle.getVolume() > avgVolume * 1.1)
                     .build();
         }
 
@@ -866,7 +882,7 @@ public class PatternRecognitionService {
     /**
      * Detect Gravestone Doji pattern
      */
-    private PatternRecognitionResult detectGravestoneDoji(Candle candle, String symbol) {
+    private PatternRecognitionResult detectGravestoneDoji(Candle candle, String symbol, double avgVolume) {
         if (!candle.isDoji()) {
             return null;
         }
@@ -885,6 +901,8 @@ public class PatternRecognitionService {
                     .description("Gravestone Doji pattern detected - potential bearish reversal")
                     .priceAtDetection(candle.getClose())
                     .resistanceLevel(candle.getHigh())
+                    .averageVolume(avgVolume)
+                    .hasVolumeConfirmation(candle.getVolume() > avgVolume * 1.1)
                     .build();
         }
 
@@ -896,7 +914,7 @@ public class PatternRecognitionService {
     /**
      * Detect Doji pattern
      */
-    private PatternRecognitionResult detectDoji(Candle candle, String symbol) {
+    private PatternRecognitionResult detectDoji(Candle candle, String symbol, double avgVolume) {
         if (candle.isDoji()) {
             return PatternRecognitionResult.builder()
                     .pattern(CandlePattern.DOJI)
@@ -907,6 +925,8 @@ public class PatternRecognitionService {
                     .confidence(60)
                     .description("Doji pattern detected - indecision in the market")
                     .priceAtDetection(candle.getClose())
+                    .averageVolume(avgVolume)
+                    .hasVolumeConfirmation(candle.getVolume() > avgVolume * 1.1)
                     .build();
         }
         return null;
@@ -915,7 +935,7 @@ public class PatternRecognitionService {
     /**
      * Detect Spinning Top pattern
      */
-    private PatternRecognitionResult detectSpinningTop(Candle candle, String symbol) {
+    private PatternRecognitionResult detectSpinningTop(Candle candle, String symbol, double avgVolume) {
         boolean hasSmallBody = candle.getBodyPercentage() > 10 && candle.getBodyPercentage() < 30;
         boolean hasSignificantShadows = candle.getUpperShadowPercentage() > 30 &&
                 candle.getLowerShadowPercentage() > 30;
@@ -930,6 +950,8 @@ public class PatternRecognitionService {
                     .confidence(60)
                     .description("Spinning Top pattern detected - market indecision")
                     .priceAtDetection(candle.getClose())
+                    .averageVolume(avgVolume)
+                    .hasVolumeConfirmation(candle.getVolume() > avgVolume * 1.1)
                     .build();
         }
 
@@ -961,22 +983,6 @@ public class PatternRecognitionService {
     }
 
     /**
-     * Calculate average volume from a list of candles
-     */
-    private double calculateAverageVolume(List<Candle> candles) {
-        if (candles == null || candles.isEmpty()) {
-            return 0.0;
-        }
-
-        // ✅ FIX: Exclude candles with zero/missing volume from average calculation
-        return candles.stream()
-                .mapToDouble(Candle::getVolume)
-                .filter(v -> v > 0)  // Ignore zero volumes
-                .average()
-                .orElse(0.0);  // Return 0 if no volume data at all
-    }
-
-    /**
      * ✅ FIX: Check if volume confirmation is SIGNIFICANT
      *
      * Requirements:
@@ -1001,7 +1007,7 @@ public class PatternRecognitionService {
         }
 
         // Require: 50% above average AND minimum 1000 volume
-        boolean result = currentVolume > avgVolume * 1.5 && currentVolume > 1000;
+        boolean result = currentVolume > avgVolume * 1.2 && currentVolume > 1000;
 
         // DEBUG: Log volume confirmation decision
         log.info("📊 Volume Check: current={}, avg={}, threshold={}, min=1000, result={}",
@@ -1114,5 +1120,166 @@ public class PatternRecognitionService {
      */
     private boolean isSignificantCandle(Candle candle) {
         return candle.getRange() >= MIN_CANDLE_RANGE;
+    }
+
+    /**
+     * ✅ NEW: Detect multi-candle chart patterns
+     */
+    private List<PatternRecognitionResult> detectChartPatterns(List<Candle> candles, String symbol) {
+        List<PatternRecognitionResult> chartPatterns = new ArrayList<>();
+
+        if (candles.size() < 20) {
+            return chartPatterns; // Need at least 20 candles
+        }
+
+        // Get the last candle (current)
+        Candle lastCandle = candles.get(candles.size() - 1);
+        double avgVolume = calculateAverageVolume(candles);
+
+        // Check for Falling Wedge (bullish)
+        if (chartPatternDetector.isFallingWedge(candles)) {
+            log.info("✅ FALLING WEDGE detected for {}", symbol);
+            chartPatterns.add(buildChartPattern(
+                    CandlePattern.FALLING_WEDGE,
+                    candles,
+                    symbol,
+                    lastCandle,
+                    avgVolume,
+                    85.0,
+                    "Falling Wedge - Bullish breakout expected",
+                    20
+            ));
+        }
+
+        // Check for Bull Flag (bullish)
+        if (chartPatternDetector.isBullFlag(candles)) {
+            log.info("✅ BULL FLAG detected for {}", symbol);
+            chartPatterns.add(buildChartPattern(
+                    CandlePattern.BULL_FLAG,
+                    candles,
+                    symbol,
+                    lastCandle,
+                    avgVolume,
+                    80.0,
+                    "Bull Flag - Continuation pattern",
+                    15
+            ));
+        }
+
+        // Check for Ascending Triangle (bullish)
+        if (chartPatternDetector.isAscendingTriangle(candles)) {
+            log.info("✅ ASCENDING TRIANGLE detected for {}", symbol);
+            chartPatterns.add(buildChartPattern(
+                    CandlePattern.ASCENDING_TRIANGLE,
+                    candles,
+                    symbol,
+                    lastCandle,
+                    avgVolume,
+                    85.0,
+                    "Ascending Triangle - Bullish breakout",
+                    20
+            ));
+        }
+
+        // Check for Double Bottom (bullish)
+        if (chartPatternDetector.isDoubleBottom(candles)) {
+            log.info("✅ DOUBLE BOTTOM detected for {}", symbol);
+            chartPatterns.add(buildChartPattern(
+                    CandlePattern.DOUBLE_BOTTOM,
+                    candles,
+                    symbol,
+                    lastCandle,
+                    avgVolume,
+                    80.0,
+                    "Double Bottom - Bullish reversal",
+                    15
+            ));
+        }
+
+        log.debug("Detected {} chart patterns for {}", chartPatterns.size(), symbol);
+
+        return chartPatterns;
+    }
+
+    /**
+     * ✅ NEW: Helper to build chart pattern result
+     */
+    private PatternRecognitionResult buildChartPattern(
+            CandlePattern pattern,
+            List<Candle> allCandles,
+            String symbol,
+            Candle lastCandle,
+            double avgVolume,
+            double confidence,
+            String description,
+            int lookback) {
+
+        // Get recent candles for pattern context
+        List<Candle> patternCandles = allCandles.subList(
+                Math.max(0, allCandles.size() - lookback),
+                allCandles.size()
+        );
+
+        // Find support and resistance
+        double support = patternCandles.stream()
+                .mapToDouble(Candle::getLow)
+                .min()
+                .orElse(lastCandle.getLow());
+
+        double resistance = patternCandles.stream()
+                .mapToDouble(Candle::getHigh)
+                .max()
+                .orElse(lastCandle.getHigh());
+
+        // Check volume confirmation
+        boolean hasVolume = lastCandle.getVolume() > avgVolume * 1.2;
+
+        return PatternRecognitionResult.builder()
+                .pattern(pattern)
+                .symbol(symbol)
+                .timestamp(lastCandle.getTimestamp())
+                .intervalMinutes(lastCandle.getIntervalMinutes())
+                .candles(new ArrayList<>(patternCandles))
+                .confidence(hasVolume ? confidence : confidence * 0.9)  // Reduce if no volume
+                .description(description)
+                .priceAtDetection(lastCandle.getClose())
+                .supportLevel(support)
+                .resistanceLevel(resistance)
+                .averageVolume(avgVolume)
+                .hasVolumeConfirmation(hasVolume)
+                .build();
+    }
+
+    /**
+     * ✅ NEW: Calculate average candle body (replaces CandleBuilderService)
+     */
+    private double calculateAverageCandleBody(List<Candle> candles) {
+        return candles == null || candles.isEmpty() ? 0.0 :
+                candles.stream()
+                        .mapToDouble(Candle::getBodySize)
+                        .average()
+                        .orElse(0.0);
+    }
+
+    /**
+     * ✅ NEW: Calculate average candle range (replaces CandleBuilderService)
+     */
+    private double calculateAverageCandleRange(List<Candle> candles) {
+        return candles == null || candles.isEmpty() ? 0.0 :
+                candles.stream()
+                        .mapToDouble(Candle::getRange)
+                        .average()
+                        .orElse(0.0);
+    }
+
+    // Note: calculateAverageVolume() already exists in your file
+// If not, add it:
+    private double calculateAverageVolume(List<Candle> candles) {
+        return candles == null || candles.isEmpty() ? 0.0 :
+                candles.stream()
+                        .mapToDouble(Candle::getVolume)
+                        .filter(v -> v > 0)
+                        .average()
+                        .orElse(0.0);
     }
 }

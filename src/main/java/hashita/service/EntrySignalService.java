@@ -94,7 +94,7 @@ public class EntrySignalService {
         try {
             Candle patternCandle = pattern.getCandles().get(pattern.getCandles().size() - 1);
 
-            double entryPrice = patternCandle.getClose();
+            double entryPrice = (patternCandle.getHigh() + patternCandle.getLow() + patternCandle.getClose()) / 3.0;
             double stopLoss = calculateStopLoss(pattern, patternCandle);
             double target = calculateTarget(pattern, patternCandle, entryPrice, stopLoss);
 
@@ -104,6 +104,10 @@ public class EntrySignalService {
 
             double signalQuality = calculateSignalQuality(pattern, riskRewardRatio);
             SignalUrgency urgency = determineUrgency(pattern, signalQuality);
+
+            double currentVolume = patternCandle.getVolume();
+            double avgVolume = pattern.getAverageVolume();
+            double volumeRatio = avgVolume > 0 ? currentVolume / avgVolume : 1.0;
 
             return EntrySignal.builder()
                     .symbol(pattern.getSymbol())
@@ -121,6 +125,9 @@ public class EntrySignalService {
                     .urgency(urgency)
                     .direction(pattern.isBullish() ? SignalDirection.LONG : SignalDirection.SHORT)
                     .reason(buildReason(pattern))
+                    .volume(currentVolume)
+                    .averageVolume(avgVolume)
+                    .volumeRatio(volumeRatio)
                     .build();
 
         } catch (Exception e) {
@@ -183,10 +190,31 @@ public class EntrySignalService {
 
     private double getPatternStrength(CandlePattern pattern) {
         return switch (pattern) {
-            case BULLISH_ENGULFING, BEARISH_ENGULFING, MORNING_STAR, EVENING_STAR -> 20;
-            case HAMMER, SHOOTING_STAR, THREE_WHITE_SOLDIERS, THREE_BLACK_CROWS -> 15;
-            case INVERTED_HAMMER, HANGING_MAN, PIERCING_LINE, DARK_CLOUD_COVER -> 10;
-            case TWEEZER_BOTTOM, TWEEZER_TOP, BULLISH_HARAMI, BEARISH_HARAMI -> 5;
+            // ✅ TIER 1: Chart Patterns (STRONGEST - 25 points)
+            case FALLING_WEDGE, RISING_WEDGE -> 25;
+
+            // ✅ TIER 2: Multi-candle formations (VERY STRONG - 22 points)
+            case BULL_FLAG, BEAR_FLAG,
+                 ASCENDING_TRIANGLE, DESCENDING_TRIANGLE,
+                 DOUBLE_BOTTOM, DOUBLE_TOP -> 22;
+
+            // TIER 3: Strong reversal patterns (20 points)
+            case BULLISH_ENGULFING, BEARISH_ENGULFING,
+                 MORNING_STAR, EVENING_STAR -> 20;
+
+            // TIER 4: Good patterns (15 points)
+            case HAMMER, SHOOTING_STAR,
+                 THREE_WHITE_SOLDIERS, THREE_BLACK_CROWS -> 15;
+
+            // TIER 5: Moderate patterns (10 points)
+            case INVERTED_HAMMER, HANGING_MAN,
+                 PIERCING_LINE, DARK_CLOUD_COVER -> 10;
+
+            // TIER 6: Weak patterns (5 points)
+            case TWEEZER_BOTTOM, TWEEZER_TOP,
+                 BULLISH_HARAMI, BEARISH_HARAMI -> 5;
+
+            // TIER 7: Very weak (2 points)
             default -> 2;
         };
     }
@@ -249,6 +277,12 @@ public class EntrySignalService {
         private SignalUrgency urgency;
         private SignalDirection direction;
         private String reason;
+        private Double volume;           // Volume at pattern detection
+        private Double averageVolume;    // Average volume for context
+        private Double volumeRatio;      // Current volume / Average volume (e.g., 1.5 = 50% above avg)
+        private Integer confluenceCount;           // Number of patterns merged (null if single pattern)
+        private List<String> confluentPatterns;    // List of pattern names that were merged
+        private Boolean isConfluence;              // True if this is a confluence signal
 
         public double getRiskPercent() {
             return (riskAmount / entryPrice) * 100;

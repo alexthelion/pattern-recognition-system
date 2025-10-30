@@ -1,186 +1,294 @@
 package hashita.controller;
 
-import hashita.service.EntrySignalService.EntrySignal;
-import hashita.service.IBKRCandleService;
-import hashita.data.PatternRecognitionResult;
 import hashita.data.Candle;
-import hashita.service.PatternAnalysisService;
-import hashita.service.EntrySignalService;
-import hashita.service.EnhancedEntrySignalService;
+import hashita.data.CandlePattern;
+import hashita.data.PatternRecognitionResult;
+import hashita.service.*;
+import hashita.service.EntrySignalService.EntrySignal;
+import jakarta.validation.constraints.*;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.util.*;
 import java.util.stream.Collectors;
 
+/**
+ * ✅ FIXED: Pattern Recognition Controller using CACHE-ONLY mode
+ *
+ * This controller NEVER calls IBKR - only uses cached data
+ * For pattern analysis on historical data
+ *
+ * @version 4.0 - Cache-only with input validation
+ */
 @RestController
-@RequestMapping("/api")
+@RequestMapping("/api/patterns")
+@RequiredArgsConstructor
 @Slf4j
 public class PatternRecognitionController {
 
-    @Autowired
-    private PatternAnalysisService patternAnalysisService;
+    private final PatternAnalysisService patternAnalysisService;
+    private final EntrySignalService entrySignalService;
+    private final EnhancedEntrySignalService enhancedEntrySignalService;
+    private final StrongPatternFilter strongPatternFilter;
+    private final IBKRCandleService ibkrCandleService;
+    private final PatternConfluenceService confluenceService;
 
-    @Autowired
-    private EntrySignalService entrySignalService;
+    public enum PatternTypeFilter {
+        ALL, CHART_ONLY, CANDLESTICK_ONLY, STRONG_ONLY
+    }
 
-    @Autowired
-    private EnhancedEntrySignalService enhancedEntrySignalService;
-
-    @Autowired
-    private IBKRCandleService ibkrCandleService;  // ✅ NEW: Use IBKR candles
-
-    /**
-     * Get entry signals with ENHANCED filters (trend + ADX) - BULLISH ONLY
-     *
-     * ✅ UPDATED: Now uses IBKR candles with 5-day context
-     */
-    @GetMapping("/signals/entry-enhanced")
-    public ResponseEntity<?> getEnhancedEntrySignals(
-            @RequestParam String symbol,
-            @RequestParam String date,
-            @RequestParam(defaultValue = "5") int interval,
-            @RequestParam(defaultValue = "75") int minQuality) {
+    @GetMapping("/signals")
+    public ResponseEntity<?> getQualitySignals(
+            @RequestParam @NotBlank @Pattern(regexp = "^[A-Z]{1,5}$") String symbol,
+            @RequestParam @NotBlank @Pattern(regexp = "^\\d{4}-\\d{2}-\\d{2}$") String date,
+            @RequestParam(defaultValue = "5") @Min(1) @Max(60) int interval,
+            @RequestParam(defaultValue = "70") @Min(0) @Max(100) int minQuality,
+            @RequestParam(defaultValue = "ALL") PatternTypeFilter patternType,
+            @RequestParam(defaultValue = "false") boolean strictMarketHours) {  // ✅ ADD THIS PARAMETER
 
         try {
-            log.info("Getting enhanced entry signals: symbol={}, minQuality={}",
-                    symbol, minQuality);
+            log.info("🔎 Getting {} signals: {} on {} (min quality: {})",
+                    patternType, symbol, date, minQuality);
 
-            // 1. Get patterns (PatternAnalysisService uses IBKR candles internally)
             List<PatternRecognitionResult> patterns =
                     patternAnalysisService.analyzeStockForDate(symbol, date, interval);
 
             if (patterns.isEmpty()) {
-                return ResponseEntity.ok(Map.of(
-                        "symbol", symbol,
-                        "date", date,
-                        "intervalMinutes", interval,
-                        "count", 0,
-                        "signals", Collections.emptyList()
-                ));
+                return ResponseEntity.ok(buildEmptyResponse(symbol, date, interval, patternType));
             }
 
-            // 2. ✅ NEW: Get candles with 5-day context from IBKR cache
-            List<Candle> allCandles = ibkrCandleService.getCandlesWithContext(symbol, date, interval);
+            List<Candle> allCandles = ibkrCandleService.getCandlesWithContext(
+                    symbol, date, interval, false);
 
             if (allCandles.isEmpty()) {
-                log.warn("No candles found for {}", symbol);
-                return ResponseEntity.ok(Map.of(
-                        "symbol", symbol,
-                        "date", date,
-                        "count", 0,
-                        "signals", Collections.emptyList()
-                ));
+                log.warn("No cached candles for {} - run /api/candles/fetch-date first", symbol);
+                return ResponseEntity.ok(buildEmptyResponse(symbol, date, interval, patternType));
             }
 
-            // 3. Convert patterns to signals with filters (prevent look-ahead bias)
             List<EntrySignal> signals = patterns.stream()
-                    .map(pattern -> {
-                        // Get base signal from EntrySignalService
-                        EntrySignal baseSignal = entrySignalService.evaluatePattern(pattern);
-
-                        if (baseSignal == null) {
-                            return null;
-                        }
-
-                        // CRITICAL: Filter candles to prevent look-ahead bias
-                        // Only use candles UP TO (and including) the pattern's timestamp
-                        List<Candle> candlesUpToPattern = allCandles.stream()
-                                .filter(c -> !c.getTimestamp().isAfter(pattern.getTimestamp()))
-                                .collect(Collectors.toList());
-
-                        if (candlesUpToPattern.isEmpty()) {
-                            log.warn("No historical candles for pattern at {}", pattern.getTimestamp());
-                            return null;
-                        }
-
-                        // Apply enhanced filters with ONLY past data
-                        return enhancedEntrySignalService.evaluateWithFilters(
-                                pattern, candlesUpToPattern, baseSignal
-                        );
-                    })
-                    .filter(s -> s != null)
+                    .map(pattern -> evaluatePattern(pattern, allCandles))
+                    .filter(Objects::nonNull)
+                    // ✅ CHANGE THIS LINE - Make market hours optional:
+                    .filter(s -> !strictMarketHours || isMarketHours(s))  // Only filter if strictMarketHours=true
+                    .filter(s -> matchesPatternType(s.getPattern(), patternType))
+                    .filter(s -> strongPatternFilter.isStrongPattern(
+                            s.getPattern(), s.getSignalQuality(), s.isHasVolumeConfirmation()))
                     .filter(s -> s.getSignalQuality() >= minQuality)
                     .filter(s -> "LONG".equals(s.getDirection().name()))
-                    .sorted(Comparator.comparing(EntrySignal::getTimestamp))  // ✅ Sort by timestamp!
+                    .sorted(Comparator.comparing(EntrySignal::getSignalQuality).reversed())
                     .collect(Collectors.toList());
 
-            log.info("Found {} high-quality signals (quality >= {})",
-                    signals.size(), minQuality);
+            signals = confluenceService.detectConfluence(signals);
+
+            log.info("✅ Found {} {} signals (from {} total patterns)",
+                    signals.size(), patternType, patterns.size());
 
             return ResponseEntity.ok(Map.of(
                     "symbol", symbol,
                     "date", date,
                     "intervalMinutes", interval,
-                    "totalPatterns", patterns.size(),
-                    "count", signals.size(),
+                    "minQuality", minQuality,
+                    "patternType", patternType.toString(),
+                    "strictMarketHours", strictMarketHours,  // ✅ ADD THIS to response
+                    "totalPatternsDetected", patterns.size(),
+                    "qualitySignals", signals.size(),
                     "signals", signals
             ));
 
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest()
+                    .body(Map.of("error", "INVALID_INPUT", "message", e.getMessage()));
         } catch (Exception e) {
-            log.error("Error getting enhanced entry signals", e);
+            log.error("Error getting quality signals: {}", e.getMessage(), e);
             return ResponseEntity.internalServerError()
-                    .body(Map.of("error", e.getMessage()));
+                    .body(Map.of("error", "INTERNAL_ERROR", "message", "Failed to get signals"));
         }
     }
 
-    /**
-     * Original entry signals endpoint (no filters)
-     */
-    @GetMapping("/signals/entry")
-    public ResponseEntity<?> getEntrySignals(
-            @RequestParam String symbol,
-            @RequestParam String date,
-            @RequestParam(defaultValue = "5") int interval) {
-
-        try {
-            List<EntrySignal> signals = entrySignalService.findEntrySignals(symbol, date, interval);
-
-            return ResponseEntity.ok(Map.of(
-                    "symbol", symbol,
-                    "date", date,
-                    "intervalMinutes", interval,
-                    "count", signals.size(),
-                    "signals", signals
-            ));
-
-        } catch (Exception e) {
-            log.error("Error getting entry signals", e);
-            return ResponseEntity.internalServerError()
-                    .body(Map.of("error", e.getMessage()));
-        }
-    }
-
-    /**
-     * Get patterns only (no signal evaluation)
-     */
-    @GetMapping("/patterns/analyze")
-    public ResponseEntity<?> analyzePatterns(
-            @RequestParam String symbol,
-            @RequestParam String date,
-            @RequestParam(defaultValue = "5") int interval) {
+    @GetMapping("/all")
+    public ResponseEntity<?> getAllPatterns(
+            @RequestParam @NotBlank @Pattern(regexp = "^[A-Z]{1,5}$") String symbol,
+            @RequestParam @NotBlank @Pattern(regexp = "^\\d{4}-\\d{2}-\\d{2}$") String date,
+            @RequestParam(defaultValue = "5") @Min(1) @Max(60) int interval) {
 
         try {
             List<PatternRecognitionResult> patterns =
                     patternAnalysisService.analyzeStockForDate(symbol, date, interval);
+
+            Map<String, List<PatternRecognitionResult>> byType = patterns.stream()
+                    .collect(Collectors.groupingBy(p ->
+                            p.getPattern().isChartPattern() ? "CHART" : "CANDLESTICK"));
 
             return ResponseEntity.ok(Map.of(
                     "symbol", symbol,
                     "date", date,
                     "intervalMinutes", interval,
                     "count", patterns.size(),
-                    "patterns", patterns
+                    "chartPatterns", byType.getOrDefault("CHART", List.of()).size(),
+                    "candlestickPatterns", byType.getOrDefault("CANDLESTICK", List.of()).size(),
+                    "patterns", patterns,
+                    "byType", byType
             ));
 
         } catch (Exception e) {
-            log.error("Error analyzing patterns", e);
+            log.error("Error getting all patterns: {}", e.getMessage(), e);
             return ResponseEntity.internalServerError()
-                    .body(Map.of("error", e.getMessage()));
+                    .body(Map.of("error", "INTERNAL_ERROR", "message", e.getMessage()));
         }
+    }
+
+    @PostMapping("/scan")
+    public ResponseEntity<?> scanMultipleSymbols(@RequestBody ScanRequest request) {
+        try {
+            // ✅ FIX: Validate input
+            if (request.symbols == null || request.symbols.isEmpty()) {
+                return ResponseEntity.badRequest()
+                        .body(Map.of("error", "INVALID_INPUT", "message", "symbols list is required"));
+            }
+
+            if (request.symbols.size() > 50) {
+                return ResponseEntity.badRequest()
+                        .body(Map.of("error", "TOO_MANY_SYMBOLS", "message", "Maximum 50 symbols allowed"));
+            }
+
+            List<String> symbols = request.symbols;
+            String date = request.date;
+            Integer interval = request.interval != null ? request.interval : 5;
+            Integer minQuality = request.minQuality != null ? request.minQuality : 70;
+            PatternTypeFilter patternType = request.patternType != null ?
+                    request.patternType : PatternTypeFilter.ALL;
+            // ✅ ADD THIS: Get strictMarketHours from request (default to false for scans)
+            boolean strictMarketHours = request.strictMarketHours != null ?
+                    request.strictMarketHours : false;
+
+            log.info("🔍 Scanning {} symbols for {} patterns", symbols.size(), patternType);
+
+            Map<String, List<EntrySignal>> results = new LinkedHashMap<>();
+
+            for (String symbol : symbols) {
+                try {
+                    ResponseEntity<?> response = getQualitySignals(
+                            symbol, date, interval, minQuality, patternType, strictMarketHours);
+
+                    if (response.getBody() != null) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> responseBody = (Map<String, Object>) response.getBody();
+
+                        @SuppressWarnings("unchecked")
+                        List<EntrySignal> signals = (List<EntrySignal>) responseBody.get("signals");
+
+                        if (signals != null && !signals.isEmpty()) {
+                            results.put(symbol, signals);
+                        }
+                    }
+
+                } catch (Exception e) {
+                    log.error("Error scanning {}: {}", symbol, e.getMessage());
+                }
+            }
+
+            List<EntrySignal> bestSignals = results.values().stream()
+                    .flatMap(List::stream)
+                    .sorted(Comparator.comparing(EntrySignal::getSignalQuality).reversed())
+                    .limit(10)
+                    .collect(Collectors.toList());
+
+            return ResponseEntity.ok(Map.of(
+                    "scannedSymbols", symbols.size(),
+                    "symbolsWithSignals", results.size(),
+                    "date", date,
+                    "interval", interval,
+                    "minQuality", minQuality,
+                    "patternType", patternType.toString(),
+                    "strictMarketHours", strictMarketHours,  // ✅ ADD THIS
+                    "resultsBySymbol", results,
+                    "topOpportunities", bestSignals
+            ));
+
+        } catch (Exception e) {
+            log.error("Error scanning symbols: {}", e.getMessage(), e);
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", "SCAN_FAILED", "message", e.getMessage()));
+        }
+    }
+
+    public static class ScanRequest {
+        @NotNull
+        @Size(min = 1, max = 50)
+        public List<@Pattern(regexp = "^[A-Z]{1,5}$") String> symbols;
+
+        @NotBlank
+        @Pattern(regexp = "^\\d{4}-\\d{2}-\\d{2}$")
+        public String date;
+
+        @Min(1) @Max(60)
+        public Integer interval;
+
+        @Min(0) @Max(100)
+        public Integer minQuality;
+
+        public PatternTypeFilter patternType;
+
+        // ✅ ADD THIS FIELD:
+        public Boolean strictMarketHours;  // Optional, defaults to false in the method
+    }
+
+    private EntrySignal evaluatePattern(PatternRecognitionResult pattern, List<Candle> allCandles) {
+        try {
+            EntrySignal baseSignal = entrySignalService.evaluatePattern(pattern);
+            if (baseSignal == null) return null;
+
+            List<Candle> candlesUpToPattern = allCandles.stream()
+                    .filter(c -> !c.getTimestamp().isAfter(pattern.getTimestamp()))
+                    .collect(Collectors.toList());
+
+            if (candlesUpToPattern.isEmpty()) return null;
+
+            return enhancedEntrySignalService.evaluateWithFilters(
+                    pattern, candlesUpToPattern, baseSignal);
+
+        } catch (Exception e) {
+            log.error("Error evaluating pattern: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private boolean isMarketHours(EntrySignal signal) {
+        ZonedDateTime nyTime = signal.getTimestamp()
+                .atZone(ZoneId.of("America/New_York"));
+        int hour = nyTime.getHour();
+        int minute = nyTime.getMinute();
+        return !(hour < 9 || (hour == 9 && minute < 30) || hour >= 16);
+    }
+
+    private boolean matchesPatternType(CandlePattern pattern, PatternTypeFilter filter) {
+        return switch (filter) {
+            case ALL -> true;
+            case CHART_ONLY -> pattern.isChartPattern();
+            case CANDLESTICK_ONLY -> !pattern.isChartPattern();
+            case STRONG_ONLY -> Set.of(
+                    CandlePattern.FALLING_WEDGE, CandlePattern.RISING_WEDGE,
+                    CandlePattern.BULL_FLAG, CandlePattern.BEAR_FLAG,
+                    CandlePattern.BULLISH_ENGULFING, CandlePattern.BEARISH_ENGULFING,
+                    CandlePattern.MORNING_STAR, CandlePattern.EVENING_STAR
+            ).contains(pattern);
+        };
+    }
+
+    private Map<String, Object> buildEmptyResponse(String symbol, String date, int interval,
+                                                   PatternTypeFilter patternType) {
+        return Map.of(
+                "symbol", symbol,
+                "date", date,
+                "intervalMinutes", interval,
+                "patternType", patternType.toString(),
+                "count", 0,
+                "message", "No patterns found or no cached data available",
+                "signals", Collections.emptyList()
+        );
     }
 }

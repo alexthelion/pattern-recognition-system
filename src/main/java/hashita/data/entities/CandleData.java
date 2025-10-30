@@ -6,6 +6,7 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.springframework.data.annotation.Id;
+import org.springframework.data.annotation.Transient;
 import org.springframework.data.mongodb.core.index.CompoundIndex;
 import org.springframework.data.mongodb.core.index.CompoundIndexes;
 import org.springframework.data.mongodb.core.mapping.Document;
@@ -64,6 +65,7 @@ public class CandleData {
     /**
      * Total number of candles
      */
+    @Transient  // ← ADD THIS
     public int getCandleCount() {
         return candles != null ? candles.size() : 0;
     }

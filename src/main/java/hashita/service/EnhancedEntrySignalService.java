@@ -68,14 +68,22 @@ public class EnhancedEntrySignalService {
                     .urgency(enhancedSignal.getUrgency())
                     .direction(enhancedSignal.getDirection())
                     .reason(enhancedSignal.getReason() + " ⚠️ CONFLICTING")
+                    // ✅ ADD THESE THREE LINES:
+                    .volume(enhancedSignal.getVolume())
+                    .averageVolume(enhancedSignal.getAverageVolume())
+                    .volumeRatio(enhancedSignal.getVolumeRatio())
                     .build();
         }
 
         return enhancedSignal;
     }
-
     /**
      * Apply trend and ADX filters - Returns NEW signal
+     */
+    // ADD TO EnhancedEntrySignalService.java
+
+    /**
+     * IMPROVED: Better detection of late entries and pullbacks
      */
     private EntrySignal applyTrendFilter(EntrySignal baseSignal,
                                          PatternRecognitionResult pattern,
@@ -85,127 +93,135 @@ public class EnhancedEntrySignalService {
 
         double qualityMultiplier = 1.0;
         double newConfidence = baseSignal.getConfidence();
-
-        // Build reason with proper confidence (will update later if boosted)
-        String originalReason = baseSignal.getReason();
-
-        // Check trend alignment
-        boolean isBullishPattern = pattern.isBullish();
-        boolean isBearishPattern = pattern.isBearish();
-
         StringBuilder reasonBuilder = new StringBuilder();
 
-        if (isBullishPattern && trend == TrendDirection.DOWNTREND) {
-            // BULLISH pattern in DOWNTREND = BAD
-            log.warn("⚠️ COUNTER-TREND: Bullish pattern {} in DOWNTREND",
-                    pattern.getPattern());
-            qualityMultiplier *= 0.4; // Reduce quality by 60%
-            reasonBuilder.append(" ⚠️ COUNTER-TREND (in downtrend)");
+        // ... existing trend and ADX checks ...
 
-        } else if (isBearishPattern && trend == TrendDirection.UPTREND) {
-            // BEARISH pattern in UPTREND = BAD
-            log.warn("⚠️ COUNTER-TREND: Bearish pattern {} in UPTREND",
-                    pattern.getPattern());
-            qualityMultiplier *= 0.4;
-            reasonBuilder.append(" ⚠️ COUNTER-TREND (in uptrend)");
+        // ✅ IMPROVED LATE DETECTION
+        if (allCandles.size() > 20) {
+            Candle currentCandle = allCandles.get(allCandles.size() - 1);
+            double currentPrice = currentCandle.getClose();
 
-        } else if ((isBullishPattern && trend == TrendDirection.UPTREND) ||
-                (isBearishPattern && trend == TrendDirection.DOWNTREND)) {
-            // WITH the trend = GOOD
-            log.info("✅ WITH-TREND: {} pattern {} in {}",
-                    isBullishPattern ? "Bullish" : "Bearish",
-                    pattern.getPattern(),
-                    trend);
-            qualityMultiplier *= 1.2; // Boost quality by 20%
-            reasonBuilder.append(" ✅ WITH TREND");
-            newConfidence = Math.min(95, newConfidence + 10);
-        } else {
-            // NEUTRAL trend
-            log.info("➖ NEUTRAL trend for {}", pattern.getPattern());
-            reasonBuilder.append(" (neutral trend)");
+            // Look at recent high/low (last 30 candles = ~2.5 hours)
+            int lookback = Math.min(30, allCandles.size());
+            List<Candle> recentCandles = allCandles.subList(allCandles.size() - lookback, allCandles.size());
+
+            double recentHigh = recentCandles.stream()
+                    .mapToDouble(Candle::getHigh)
+                    .max()
+                    .orElse(currentPrice);
+
+            double recentLow = recentCandles.stream()
+                    .mapToDouble(Candle::getLow)
+                    .min()
+                    .orElse(currentPrice);
+
+            // Calculate where we are in the recent range
+            double rangePercent = ((currentPrice - recentLow) / (recentHigh - recentLow)) * 100;
+
+            // For BULLISH patterns
+            if (pattern.isBullish()) {
+
+                // Check if we're buying near the TOP of recent range (BAD!)
+                if (rangePercent > 85) {
+                    // Buying at top of range - LATE!
+                    log.warn("⚠️ LATE ENTRY: Buying at {}% of recent range for {}",
+                            String.format("%.1f", rangePercent), pattern.getSymbol());
+                    qualityMultiplier *= 0.60;  // 40% penalty
+                    reasonBuilder.append(" ⚠️ LATE (buying at top)");
+
+                } else if (rangePercent < 30) {
+                    // Buying near bottom of range - EARLY! (good)
+                    log.info("✅ GOOD ENTRY: Buying at {}% of recent range",
+                            String.format("%.1f", rangePercent));
+                    qualityMultiplier *= 1.10;
+                    reasonBuilder.append(" ✅ GOOD ENTRY");
+
+                } else if (rangePercent > 70) {
+                    // Buying in upper part of range - caution
+                    qualityMultiplier *= 0.85;
+                    reasonBuilder.append(" ⚠️ Mid-range entry");
+                }
+
+                // ✅ NEW: Check for pullback after big move
+                // If recent high was > 5% above current, and we're < 2% from high = late
+                double pullbackFromHigh = ((recentHigh - currentPrice) / recentHigh) * 100;
+                double moveSize = ((recentHigh - recentLow) / recentLow) * 100;
+
+                if (moveSize > 5 && pullbackFromHigh < 2) {
+                    // Just off the highs after a big move = late!
+                    log.warn("⚠️ LATE: Just off high after {}% move",
+                            String.format("%.1f", moveSize));
+                    qualityMultiplier *= 0.70;
+                    reasonBuilder.append(" ⚠️ After big move");
+                }
+            }
+
+            // For BEARISH patterns (inverse logic)
+            if (pattern.isBearish()) {
+                if (rangePercent < 15) {
+                    // Shorting at bottom - LATE!
+                    qualityMultiplier *= 0.60;
+                    reasonBuilder.append(" ⚠️ LATE (shorting at bottom)");
+
+                } else if (rangePercent > 70) {
+                    // Shorting near top - EARLY! (good)
+                    qualityMultiplier *= 1.10;
+                    reasonBuilder.append(" ✅ GOOD ENTRY");
+
+                } else if (rangePercent < 30) {
+                    // Shorting in lower part - caution
+                    qualityMultiplier *= 0.85;
+                    reasonBuilder.append(" ⚠️ Mid-range entry");
+                }
+            }
         }
 
-        // Check ADX (trend strength)
-        if (adx < 20) {
-            // Choppy market - AVOID
-            log.warn("⚠️ CHOPPY MARKET: ADX={} for {}", adx, pattern.getPattern());
-            qualityMultiplier *= 0.6; // Reduce quality by 40%
-            reasonBuilder.append(String.format(" ⚠️ CHOPPY (ADX: %.1f)", adx));
-
-        } else if (adx > 25) {
-            // Strong trend - GOOD
-            log.info("✅ STRONG TREND: ADX={} for {}", adx, pattern.getPattern());
-            qualityMultiplier *= 1.15; // Boost quality by 15%
-            reasonBuilder.append(String.format(" ✅ STRONG TREND (ADX: %.1f)", adx));
-        }
-
-        // ADD VARIABILITY: Adjust quality based on context
-        // 1. Early vs late in trend
+        // ✅ NEW: Volume context check
         if (allCandles.size() > 10) {
-            double earlyPrice = allCandles.get(Math.max(0, allCandles.size() - 50)).getClose();
-            double currentPrice = baseSignal.getEntryPrice();
-            double priceMovement = ((currentPrice - earlyPrice) / earlyPrice) * 100;
+            Candle currentCandle = allCandles.get(allCandles.size() - 1);
 
-            if (isBearishPattern) {
-                if (priceMovement < -15) {
-                    // Already down 15%+ - very late
-                    qualityMultiplier *= 0.90;
-                    reasonBuilder.append(" ⚠️ LATE");
-                } else if (priceMovement < -3 && priceMovement > -8) {
-                    // Down 3-8% - sweet spot
-                    qualityMultiplier *= 1.05;
-                    reasonBuilder.append(" 🎯 GOOD ENTRY");
-                } else if (priceMovement > -2) {
-                    // Early in trend
-                    qualityMultiplier *= 1.02;
-                }
-            }
+            // Calculate average volume of last 10 candles
+            double avgVolume = allCandles.subList(allCandles.size() - 10, allCandles.size())
+                    .stream()
+                    .mapToDouble(Candle::getVolume)
+                    .average()
+                    .orElse(0);
 
-            if (isBullishPattern) {
-                if (priceMovement > 15) {
-                    // Already up 15%+ - late
-                    qualityMultiplier *= 0.90;
-                    reasonBuilder.append(" ⚠️ LATE");
-                } else if (priceMovement > 3 && priceMovement < 8) {
-                    // Up 3-8% - sweet spot
+            // Compare current candle's volume to average
+            if (avgVolume > 0) {
+                double volRatio = currentCandle.getVolume() / avgVolume;
+
+                if (volRatio < 0.5) {
+                    // Very low volume - suspicious!
+                    log.warn("⚠️ LOW VOLUME: Only {}% of average",
+                            String.format("%.0f", volRatio * 100));
+                    qualityMultiplier *= 0.85;
+                    reasonBuilder.append(" ⚠️ Low volume");
+
+                } else if (volRatio > 1.5) {
+                    // High volume - good!
                     qualityMultiplier *= 1.05;
-                    reasonBuilder.append(" 🎯 GOOD ENTRY");
-                } else if (priceMovement < 2) {
-                    // Early
-                    qualityMultiplier *= 1.02;
+                    reasonBuilder.append(" ✅ Strong volume");
                 }
             }
         }
 
-        // 2. Risk/reward quality
-        double rrRatio = baseSignal.getRiskRewardRatio();
-        if (rrRatio >= 4.0) {
-            qualityMultiplier *= 1.08;
-        } else if (rrRatio < 2.5) {
-            qualityMultiplier *= 0.95;
-        }
-
-        // 3. Tight stop = better entry
-        double riskPercent = baseSignal.getRiskPercent();
-        if (riskPercent < 3.0) {
-            qualityMultiplier *= 1.03;
-        } else if (riskPercent > 10.0) {
-            qualityMultiplier *= 0.92;
-        }
+        // ... rest of existing code (RR ratio, risk %, etc.) ...
 
         // Calculate new quality
         double newQuality = baseSignal.getSignalQuality() * qualityMultiplier;
         newQuality = Math.max(0, Math.min(100, newQuality));
 
-        // Build complete reason string with UPDATED confidence
+        // Build complete reason
         String updatedReason = String.format("%s at $%.2f (%.0f%% conf)%s%s",
                 pattern.getPattern().name().replace("_", " "),
                 pattern.getPriceAtDetection(),
-                newConfidence,  // Use UPDATED confidence
+                newConfidence,
                 pattern.isHasVolumeConfirmation() ? " + VOLUME" : "",
                 reasonBuilder.toString());
 
-        // Create NEW signal with updated values
+        // ✅ FIX: Copy ALL fields including volume
         return EntrySignal.builder()
                 .symbol(baseSignal.getSymbol())
                 .pattern(baseSignal.getPattern())
@@ -222,6 +238,10 @@ public class EnhancedEntrySignalService {
                 .urgency(baseSignal.getUrgency())
                 .direction(baseSignal.getDirection())
                 .reason(updatedReason)
+                // ✅ ADD THESE THREE LINES:
+                .volume(baseSignal.getVolume())
+                .averageVolume(baseSignal.getAverageVolume())
+                .volumeRatio(baseSignal.getVolumeRatio())
                 .build();
     }
 

@@ -5,21 +5,11 @@ import hashita.config.IBKRProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
-import java.time.Instant;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.concurrent.*;
 
 /**
- * IBKR API Client for fetching historical bar data
- *
- * This wraps the Interactive Brokers API and provides a simple interface
- * for requesting historical candle data.
+ * IBKR API Client with Real-Time Market Data Support
  */
 @Component
 @Slf4j
@@ -30,10 +20,15 @@ public class IBKRClient implements EWrapper {
     private EReaderSignal signal;
     private volatile boolean connected = false;
 
-    // Request tracking
+    // Request tracking for historical data
     private int nextRequestId = 1000;
     private final Map<Integer, CompletableFuture<List<Bar>>> pendingRequests = new ConcurrentHashMap<>();
     private final Map<Integer, List<Bar>> requestData = new ConcurrentHashMap<>();
+
+    // Request tracking for market data
+    private final Map<Integer, CompletableFuture<Double>> pendingPriceRequests = new ConcurrentHashMap<>();
+    private final Map<String, MarketDataCache> priceCache = new ConcurrentHashMap<>();
+    private static final long CACHE_TTL_MS = 60_000; // 1 minute
 
     public IBKRClient(IBKRProperties properties) {
         this.properties = properties;
@@ -99,9 +94,10 @@ public class IBKRClient implements EWrapper {
             return;
         }
 
-        log.info("Disconnecting from IBKR");
+        log.info("Disconnecting from IBKR...");
         clientSocket.eDisconnect();
         connected = false;
+        log.info("Disconnected from IBKR");
     }
 
     /**
@@ -113,12 +109,6 @@ public class IBKRClient implements EWrapper {
 
     /**
      * Request historical bars for a symbol
-     *
-     * @param symbol Stock symbol (e.g., "MGN", "AAPL")
-     * @param endDateTime End date/time in "yyyyMMdd HH:mm:ss" format or "yyyyMMdd" for EOD
-     * @param durationStr Duration string (e.g., "1 D", "1 W", "1 M")
-     * @param barSizeSetting Bar size (e.g., "1 min", "5 mins", "1 hour")
-     * @return List of bars
      */
     public List<Bar> getHistoricalBars(
             String symbol,
@@ -150,16 +140,16 @@ public class IBKRClient implements EWrapper {
 
         // Request historical data
         clientSocket.reqHistoricalData(
-                reqId,                          // request ID
-                contract,                       // contract
-                endDateTime,                    // end date/time
-                durationStr,                    // duration
-                barSizeSetting,                 // bar size
-                Types.WhatToShow.TRADES.name(), // what to show
-                0,                              // use RTH (regular trading hours)
-                2,                              // format date (2 = UTC seconds)
-                false,                          // keep up to date
-                new ArrayList<>()               // chart options
+                reqId,
+                contract,
+                endDateTime,
+                durationStr,
+                barSizeSetting,
+                Types.WhatToShow.TRADES.name(),
+                0,
+                2,
+                false,
+                new ArrayList<>()
         );
 
         // Wait for response (timeout after 30 seconds)
@@ -179,70 +169,182 @@ public class IBKRClient implements EWrapper {
         }
     }
 
-    // ========================================
-    // EWrapper callback implementations
-    // ========================================
+    /**
+     * Get real-time price for a symbol
+     */
+    public Double getRealTimePrice(String symbol) {
+        try {
+            // Check cache first
+            MarketDataCache cached = priceCache.get(symbol);
+            if (cached != null && !cached.isExpired()) {
+                log.debug("✅ Using cached price for {}: ${}", symbol, cached.price);
+                return cached.price;
+            }
+
+            if (!isConnected()) {
+                connect();
+            }
+
+            log.info("📡 Requesting real-time price for {}...", symbol);
+
+            // Create contract
+            Contract contract = new Contract();
+            contract.symbol(symbol);
+            contract.secType(Types.SecType.STK);
+            contract.exchange(properties.getDefaultStockExchange());
+            contract.currency(properties.getDefaultStockCurrency());
+
+            // Generate request ID
+            int reqId = nextRequestId++;
+
+            // Create future for this request
+            CompletableFuture<Double> future = new CompletableFuture<>();
+            pendingPriceRequests.put(reqId, future);
+
+            log.debug("Requesting market data: symbol={}, reqId={}", symbol, reqId);
+
+            // Request market data (snapshot mode)
+            clientSocket.reqMktData(
+                    reqId,
+                    contract,
+                    "",      // generic tick list
+                    true,    // snapshot = true (one-time request)
+                    false,   // regulatory snapshot
+                    new ArrayList<>()
+            );
+
+            // Wait for response (timeout after 5 seconds)
+            try {
+                Double price = future.get(5, TimeUnit.SECONDS);
+
+                if (price != null && price > 0) {
+                    // Cache the price
+                    priceCache.put(symbol, new MarketDataCache(price, System.currentTimeMillis()));
+                    log.info("✅ Got real-time price for {}: ${}", symbol, price);
+                    return price;
+                } else {
+                    log.warn("⚠️ Invalid price received for {}: {}", symbol, price);
+                    return null;
+                }
+
+            } catch (TimeoutException e) {
+                log.warn("⏱️ Timeout getting price for {}: took > 5 seconds", symbol);
+                return null;
+            } catch (Exception e) {
+                log.error("Error waiting for price: {}", e.getMessage());
+                return null;
+            } finally {
+                // Cleanup
+                pendingPriceRequests.remove(reqId);
+                clientSocket.cancelMktData(reqId);
+            }
+
+        } catch (Exception e) {
+            log.error("❌ Error getting real-time price for {}: {}", symbol, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Clear price cache
+     */
+    public void clearPriceCache() {
+        priceCache.clear();
+        log.info("Cleared price cache");
+    }
+
+    /**
+     * Clear cache for specific symbol
+     */
+    public void clearPriceCache(String symbol) {
+        priceCache.remove(symbol);
+        log.info("Cleared price cache for {}", symbol);
+    }
+
+    /**
+     * Get client socket for advanced usage
+     */
+    public EClientSocket getEClientSocket() {
+        return clientSocket;
+    }
+
+    // ==================== EWrapper Implementation ====================
 
     @Override
     public void historicalData(int reqId, Bar bar) {
-        // Add bar to request data
         List<Bar> bars = requestData.get(reqId);
         if (bars != null) {
             bars.add(bar);
-            log.debug("Received bar for reqId {}: time={}, O={}, H={}, L={}, C={}, V={}",
-                    reqId, bar.time(), bar.open(), bar.high(), bar.low(), bar.close(), bar.volume());
         }
     }
 
     @Override
     public void historicalDataEnd(int reqId, String startDateStr, String endDateStr) {
-        log.debug("Historical data complete for reqId {}: {} to {}", reqId, startDateStr, endDateStr);
-
-        // Complete the future with the collected bars
         CompletableFuture<List<Bar>> future = pendingRequests.get(reqId);
-        List<Bar> bars = requestData.get(reqId);
-
-        if (future != null && bars != null) {
-            future.complete(new ArrayList<>(bars));
+        if (future != null) {
+            List<Bar> bars = requestData.get(reqId);
+            future.complete(bars != null ? bars : new ArrayList<>());
         }
     }
 
     @Override
-    public void error(int id, int errorCode, String errorMsg, String advancedOrderRejectJson) {
-        if (errorCode == 2104 || errorCode == 2106 || errorCode == 2158 || errorCode == 2174) {
-            // Informational messages/warnings, not errors
-            // 2174 = timezone warning (we're now using UTC explicitly)
-            log.debug("IBKR message {}: {}", errorCode, errorMsg);
-            return;
+    public void tickPrice(int tickerId, int field, double price, TickAttrib attrib) {
+        CompletableFuture<Double> future = pendingPriceRequests.get(tickerId);
+
+        if (future != null && !future.isDone()) {
+            // Field 4 = LAST, Field 1 = BID, Field 2 = ASK
+            if (field == 4 || field == 1 || field == 2) {
+                log.debug("Received tick price: reqId={}, field={}, price={}", tickerId, field, price);
+
+                if (price > 0) {
+                    future.complete(price);
+                }
+            }
         }
+    }
 
-        log.error("IBKR Error - reqId: {}, code: {}, msg: {}", id, errorCode, errorMsg);
+    @Override
+    public void tickSnapshotEnd(int reqId) {
+        log.debug("Snapshot complete for reqId={}", reqId);
 
-        // Complete future with error if it's a pending request
-        CompletableFuture<List<Bar>> future = pendingRequests.get(id);
-        if (future != null) {
-            future.completeExceptionally(new RuntimeException(
-                    "IBKR Error " + errorCode + ": " + errorMsg));
+        CompletableFuture<Double> future = pendingPriceRequests.get(reqId);
+        if (future != null && !future.isDone()) {
+            future.complete(null);
+        }
+    }
+
+    @Override
+    public void marketDataType(int i, int i1) {
+
+    }
+
+    @Override
+    public void error(int id, int errorCode, String errorMsg, String advancedOrderRejectJson) {
+        log.warn("IBKR Error: id={}, code={}, msg={}", id, errorCode, errorMsg);
+
+        // Complete futures with exception for serious errors
+        if (errorCode >= 500) {
+            CompletableFuture<List<Bar>> histFuture = pendingRequests.get(id);
+            if (histFuture != null) {
+                histFuture.completeExceptionally(
+                        new RuntimeException("IBKR Error " + errorCode + ": " + errorMsg));
+            }
+
+            CompletableFuture<Double> priceFuture = pendingPriceRequests.get(id);
+            if (priceFuture != null) {
+                priceFuture.completeExceptionally(
+                        new RuntimeException("IBKR Error " + errorCode + ": " + errorMsg));
+            }
         }
     }
 
     @Override
     public void connectionClosed() {
-        log.warn("IBKR connection closed");
+        log.warn("⚠️ IBKR connection closed");
         connected = false;
     }
 
-    @Override
-    public void connectAck() {
-        log.info("IBKR connection acknowledged");
-        connected = true;
-    }
-
-    // ========================================
-    // Required EWrapper methods (mostly unused)
-    // ========================================
-
-    @Override public void tickPrice(int tickerId, int field, double price, TickAttrib attrib) {}
+    // Required EWrapper stub methods
     @Override public void tickSize(int tickerId, int field, Decimal size) {}
     @Override public void tickOptionComputation(int tickerId, int field, int tickAttrib, double impliedVol, double delta, double optPrice, double pvDividend, double gamma, double vega, double theta, double undPrice) {}
     @Override public void tickGeneric(int tickerId, int tickType, double value) {}
@@ -273,8 +375,6 @@ public class IBKRClient implements EWrapper {
     @Override public void currentTime(long time) {}
     @Override public void fundamentalData(int reqId, String data) {}
     @Override public void deltaNeutralValidation(int reqId, DeltaNeutralContract deltaNeutralContract) {}
-    @Override public void tickSnapshotEnd(int reqId) {}
-    @Override public void marketDataType(int reqId, int marketDataType) {}
     @Override public void commissionReport(CommissionReport commissionReport) {}
     @Override public void position(String account, Contract contract, Decimal pos, double avgCost) {}
     @Override public void positionEnd() {}
@@ -286,18 +386,50 @@ public class IBKRClient implements EWrapper {
     @Override public void verifyAndAuthCompleted(boolean isSuccessful, String errorText) {}
     @Override public void displayGroupList(int reqId, String groups) {}
     @Override public void displayGroupUpdated(int reqId, String contractInfo) {}
-    @Override public void error(Exception e) { log.error("IBKR error", e); }
-    @Override public void error(String str) { log.error("IBKR error: {}", str); }
+    @Override public void error(Exception e) { log.error("IBKR Error", e); }
+    @Override public void error(String str) { log.error("IBKR Error: {}", str); }
+    @Override public void connectAck() { log.info("IBKR Connection acknowledged"); }
     @Override public void positionMulti(int reqId, String account, String modelCode, Contract contract, Decimal pos, double avgCost) {}
     @Override public void positionMultiEnd(int reqId) {}
     @Override public void accountUpdateMulti(int reqId, String account, String modelCode, String key, String value, String currency) {}
     @Override public void accountUpdateMultiEnd(int reqId) {}
-    @Override public void securityDefinitionOptionalParameter(int reqId, String exchange, int underlyingConId, String tradingClass, String multiplier, java.util.Set<String> expirations, java.util.Set<Double> strikes) {}
+
+    @Override
+    public void securityDefinitionOptionalParameter(int i, String s, int i1, String s1, String s2, Set<String> set, Set<Double> set1) {
+
+    }
+
     @Override public void securityDefinitionOptionalParameterEnd(int reqId) {}
     @Override public void softDollarTiers(int reqId, SoftDollarTier[] tiers) {}
     @Override public void familyCodes(FamilyCode[] familyCodes) {}
     @Override public void symbolSamples(int reqId, ContractDescription[] contractDescriptions) {}
     @Override public void historicalDataUpdate(int reqId, Bar bar) {}
+
+    @Override
+    public void rerouteMktDataReq(int i, int i1, String s) {
+
+    }
+
+    @Override
+    public void rerouteMktDepthReq(int i, int i1, String s) {
+
+    }
+
+    @Override
+    public void marketRule(int i, PriceIncrement[] priceIncrements) {
+
+    }
+
+    @Override
+    public void pnl(int i, double v, double v1, double v2) {
+
+    }
+
+    @Override
+    public void pnlSingle(int i, Decimal decimal, double v, double v1, double v2, double v3) {
+
+    }
+
     @Override public void mktDepthExchanges(DepthMktDataDescription[] depthMktDataDescriptions) {}
     @Override public void tickNews(int tickerId, long timeStamp, String providerCode, String articleId, String headline, String extraData) {}
     @Override public void smartComponents(int reqId, Map<Integer, Map.Entry<String, Character>> theMap) {}
@@ -307,15 +439,10 @@ public class IBKRClient implements EWrapper {
     @Override public void historicalNews(int requestId, String time, String providerCode, String articleId, String headline) {}
     @Override public void historicalNewsEnd(int requestId, boolean hasMore) {}
     @Override public void headTimestamp(int reqId, String headTimestamp) {}
-    @Override public void histogramData(int reqId, java.util.List<HistogramEntry> items) {}
-    @Override public void rerouteMktDataReq(int reqId, int conId, String exchange) {}
-    @Override public void rerouteMktDepthReq(int reqId, int conId, String exchange) {}
-    @Override public void marketRule(int marketRuleId, PriceIncrement[] priceIncrements) {}
-    @Override public void pnl(int reqId, double dailyPnL, double unrealizedPnL, double realizedPnL) {}
-    @Override public void pnlSingle(int reqId, Decimal pos, double dailyPnL, double unrealizedPnL, double realizedPnL, double value) {}
-    @Override public void historicalTicks(int reqId, java.util.List<HistoricalTick> ticks, boolean done) {}
-    @Override public void historicalTicksBidAsk(int reqId, java.util.List<HistoricalTickBidAsk> ticks, boolean done) {}
-    @Override public void historicalTicksLast(int reqId, java.util.List<HistoricalTickLast> ticks, boolean done) {}
+    @Override public void histogramData(int reqId, List<HistogramEntry> items) {}
+    @Override public void historicalTicks(int reqId, List<HistoricalTick> ticks, boolean done) {}
+    @Override public void historicalTicksBidAsk(int reqId, List<HistoricalTickBidAsk> ticks, boolean done) {}
+    @Override public void historicalTicksLast(int reqId, List<HistoricalTickLast> ticks, boolean done) {}
     @Override public void tickByTickAllLast(int reqId, int tickType, long time, double price, Decimal size, TickAttribLast tickAttribLast, String exchange, String specialConditions) {}
     @Override public void tickByTickBidAsk(int reqId, long time, double bidPrice, double askPrice, Decimal bidSize, Decimal askSize, TickAttribBidAsk tickAttribBidAsk) {}
     @Override public void tickByTickMidPoint(int reqId, long time, double midPoint) {}
@@ -325,6 +452,23 @@ public class IBKRClient implements EWrapper {
     @Override public void replaceFAEnd(int reqId, String text) {}
     @Override public void wshMetaData(int reqId, String dataJson) {}
     @Override public void wshEventData(int reqId, String dataJson) {}
-    @Override public void historicalSchedule(int reqId, String startDateTime, String endDateTime, String timeZone, java.util.List<HistoricalSession> sessions) {}
+    @Override public void historicalSchedule(int reqId, String startDateTime, String endDateTime, String timeZone, List<HistoricalSession> sessions) {}
     @Override public void userInfo(int reqId, String whiteBrandingId) {}
+
+    /**
+     * Market data cache entry
+     */
+    private static class MarketDataCache {
+        final double price;
+        final long timestamp;
+
+        MarketDataCache(double price, long timestamp) {
+            this.price = price;
+            this.timestamp = timestamp;
+        }
+
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestamp > CACHE_TTL_MS;
+        }
+    }
 }

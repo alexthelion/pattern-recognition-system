@@ -7,6 +7,7 @@ import hashita.repository.CandleDataRepository;
 import hashita.repository.StockDataRepository;
 import hashita.service.ibkr.IBKRClient;
 import com.ib.client.Bar;
+import com.google.common.util.concurrent.RateLimiter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.mongodb.core.MongoTemplate;
@@ -15,22 +16,25 @@ import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.stereotype.Service;
 
-import java.time.Instant;
-import java.time.LocalDate;
-import java.time.ZoneId;
+import java.time.*;
 import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 /**
- * Service to fetch and cache candles from IBKR
+ * ✅ FIXED: Service to fetch and cache candles from IBKR
  *
- * This replaces CandleBuilderService for production use
- * Benefits:
- * - No timezone conversion bugs
- * - Accurate OHLCV from IBKR
- * - Fast (cached in MongoDB)
- * - Can re-run pattern detection without re-fetching
+ * CRITICAL RULES:
+ * 1. getCandlesFromCacheOnly() - NEVER calls IBKR (for simulations/analysis)
+ * 2. getCandles() - May call IBKR if cache miss (for realtime only)
+ * 3. fetchFromIBKR() - Direct IBKR call (for CandleManagementController)
+ *
+ * Thread-safe with proper synchronization
+ * Rate-limited to prevent IBKR throttling
  */
 @Service
 @Slf4j
@@ -40,79 +44,34 @@ public class IBKRCandleService {
     private final CandleDataRepository candleDataRepository;
     private final StockDataRepository stockDataRepository;
     private final IBKRClient ibkrClient;
-    private final MongoTemplate mongoTemplate;  // ✅ NEW: For upsert operations
+    private final MongoTemplate mongoTemplate;
+
+    // ✅ FIX: Thread-safe locks per symbol to prevent race conditions
+    private final ConcurrentHashMap<String, Lock> symbolLocks = new ConcurrentHashMap<>();
+
+    // ✅ FIX: Rate limiter to prevent IBKR API abuse (2 requests per second)
+    private final RateLimiter rateLimiter = RateLimiter.create(2.0);
 
     /**
-     * Get candles for a symbol/date/interval
-     * - First checks MongoDB cache (unless forceRefresh=true)
-     * - If not cached, checks if we have recent history
-     * - Only fetches from IBKR if needed
+     * ✅ CACHE-ONLY MODE (for simulations/analysis)
      *
-     * @param symbol Stock symbol
-     * @param date Date in yyyy-MM-dd format
-     * @param intervalMinutes Interval (1, 5, 15, 30, 60)
-     * @param forceRefresh If true, skip cache and fetch fresh from IBKR
-     * @return List of candles (includes 5 days of history)
-     */
-    public List<Candle> getCandles(String symbol, String date, int intervalMinutes, boolean forceRefresh) {
-        log.debug("Getting candles for {} on {} ({}min, forceRefresh={})",
-                symbol, date, intervalMinutes, forceRefresh);
-
-        // Check cache first (unless force refresh)
-        if (!forceRefresh) {
-            Optional<CandleData> cached = candleDataRepository
-                    .findBySymbolAndDateAndIntervalMinutes(symbol, date, intervalMinutes);
-
-            if (cached.isPresent()) {
-                log.debug("✅ Using cached candles: {} candles", cached.get().getCandleCount());
-                return cached.get().getCandles();
-            }
-
-            // Cache miss - but check if we have recent history that includes this date
-            List<Candle> existingCandles = findCandlesFromRecentCache(symbol, date, intervalMinutes);
-            if (!existingCandles.isEmpty()) {
-                log.info("✅ Found {} candles from recent cache (no IBKR fetch needed)", existingCandles.size());
-                // Cache under this date for future lookups using UPSERT
-                upsertCandles(symbol, date, intervalMinutes, existingCandles);
-                return existingCandles;
-            }
-        } else {
-            log.info("🔄 Force refresh requested - skipping cache");
-        }
-
-        // No cache hit OR force refresh - fetch from IBKR
-        // Note: fetchFromIBKR() already caches the data via cachePerDate()
-        log.info("⬇️ Fetching candles from IBKR for {} on {}", symbol, date);
-        List<Candle> candles = fetchFromIBKR(symbol, date, intervalMinutes);
-
-        return candles;
-    }
-
-    /**
-     * Convenience method - calls getCandles with forceRefresh=false
-     */
-    public List<Candle> getCandles(String symbol, String date, int intervalMinutes) {
-        return getCandles(symbol, date, intervalMinutes, false);
-    }
-
-    /**
-     * Get candles from cache ONLY - never fetch from IBKR
-     * Used for simulations and backtesting where we only want cached data
+     * Get candles from cache ONLY - NEVER fetches from IBKR
+     * Used by:
+     * - AlertSimulationController
+     * - PatternAnalysisService
+     * - PatternRecognitionController
      *
-     * @param symbol Stock symbol
-     * @param date Date in yyyy-MM-dd format
-     * @param intervalMinutes Interval (1, 5, 15, 30, 60)
-     * @return List of candles from cache, or empty list if not cached
+     * Returns empty list if not cached
      */
     public List<Candle> getCandlesFromCacheOnly(String symbol, String date, int intervalMinutes) {
-        log.debug("Getting CACHED candles for {} on {} ({}min)", symbol, date, intervalMinutes);
+        log.debug("📦 Getting CACHED candles for {} on {} ({}min)", symbol, date, intervalMinutes);
 
         // Check direct cache hit
         Optional<CandleData> cached = candleDataRepository
                 .findBySymbolAndDateAndIntervalMinutes(symbol, date, intervalMinutes);
 
         if (cached.isPresent()) {
-            log.debug("✅ Cache hit: {} candles", cached.get().getCandleCount());
+            log.debug("✅ Cache HIT: {} candles", cached.get().getCandleCount());
             return cached.get().getCandles();
         }
 
@@ -126,19 +85,344 @@ public class IBKRCandleService {
         }
 
         // No cache - return empty (DO NOT fetch from IBKR!)
-        log.warn("⚠️ No cached data for {} on {} - returning empty", symbol, date);
+        log.warn("⚠️ Cache MISS for {} on {} - returning empty (use /fetch-date to populate)",
+                symbol, date);
         return new ArrayList<>();
     }
 
     /**
+     * ✅ REALTIME MODE (for live trading)
+     *
+     * Get candles - checks cache first, may fetch from IBKR on cache miss
+     * Used by:
+     * - RealtimePatternController only
+     *
+     * Thread-safe with per-symbol locking to prevent duplicate IBKR calls
+     */
+    public List<Candle> getCandles(String symbol, String date, int intervalMinutes) {
+        return getCandles(symbol, date, intervalMinutes, false);
+    }
+
+    /**
+     * ✅ REALTIME MODE with force refresh option
+     */
+    public List<Candle> getCandles(String symbol, String date, int intervalMinutes, boolean forceRefresh) {
+        // ✅ FIX: Lock per symbol+date to prevent race conditions
+        String lockKey = symbol + ":" + date + ":" + intervalMinutes;
+        Lock lock = symbolLocks.computeIfAbsent(lockKey, k -> new ReentrantLock());
+
+        lock.lock();
+        try {
+            log.debug("🔄 Getting candles for {} on {} ({}min, forceRefresh={})",
+                    symbol, date, intervalMinutes, forceRefresh);
+
+            // Check cache first (unless force refresh)
+            if (!forceRefresh) {
+                Optional<CandleData> cached = candleDataRepository
+                        .findBySymbolAndDateAndIntervalMinutes(symbol, date, intervalMinutes);
+
+                if (cached.isPresent()) {
+                    log.debug("✅ Using cached candles: {} candles", cached.get().getCandleCount());
+                    return cached.get().getCandles();
+                }
+
+                // Cache miss - but check if we have recent history that includes this date
+                List<Candle> existingCandles = findCandlesFromRecentCache(symbol, date, intervalMinutes);
+                if (!existingCandles.isEmpty()) {
+                    log.info("✅ Found {} candles from recent cache (no IBKR fetch needed)",
+                            existingCandles.size());
+                    // Cache under this date for future lookups
+                    upsertCandles(symbol, date, intervalMinutes, existingCandles);
+                    return existingCandles;
+                }
+            } else {
+                log.info("🔄 Force refresh requested - skipping cache");
+            }
+
+            // ✅ FIX: Rate limit IBKR calls
+            log.info("⬇️ Fetching candles from IBKR for {} on {} (rate-limited)", symbol, date);
+            rateLimiter.acquire(); // Wait if needed
+
+            List<Candle> candles = fetchFromIBKR(symbol, date, intervalMinutes);
+            return candles;
+
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Get candles for pattern analysis with 4 days of historical context
+     *
+     * ✅ CACHE-ONLY by default
+     * Only fetches if allowFetch=true (for realtime controller)
+     */
+    public List<Candle> getCandlesWithContext(String symbol, String date, int intervalMinutes) {
+        return getCandlesWithContext(symbol, date, intervalMinutes, false);
+    }
+
+    /**
+     * ✅ NEW: Version with fetch control
+     */
+    public List<Candle> getCandlesWithContext(String symbol, String date, int intervalMinutes,
+                                              boolean allowFetch) {
+        try {
+            LocalDate targetDate = LocalDate.parse(date);
+            List<Candle> allCandles = new ArrayList<>();
+
+            // Get 4 days of history + target date
+            for (int daysBack = 4; daysBack >= 0; daysBack--) {
+                String checkDate = targetDate.minusDays(daysBack)
+                        .format(DateTimeFormatter.ISO_LOCAL_DATE);
+
+                List<Candle> dayCandles;
+
+                if (allowFetch) {
+                    // Realtime mode - may fetch from IBKR
+                    dayCandles = getCandles(symbol, checkDate, intervalMinutes);
+                } else {
+                    // Cache-only mode - no IBKR calls
+                    dayCandles = getCandlesFromCacheOnly(symbol, checkDate, intervalMinutes);
+                }
+
+                if (!dayCandles.isEmpty()) {
+                    allCandles.addAll(dayCandles);
+                }
+            }
+
+            if (allCandles.isEmpty()) {
+                log.warn("No candles found for {} (checked {} to {})",
+                        symbol, targetDate.minusDays(4), targetDate);
+                return new ArrayList<>();
+            }
+
+            // Sort by timestamp and remove duplicates
+            allCandles = allCandles.stream()
+                    .sorted(Comparator.comparing(Candle::getTimestamp))
+                    .distinct()
+                    .collect(Collectors.toList());
+
+            log.debug("Retrieved {} total candles for {} with context", allCandles.size(), symbol);
+            return allCandles;
+
+        } catch (Exception e) {
+            log.error("Error getting candles with context for {}: {}", symbol, e.getMessage(), e);
+            return new ArrayList<>();
+        }
+    }
+
+    /**
+     * ✅ BATCH FETCH MODE (for CandleManagementController)
+     *
+     * Fetch and cache candles for all symbols on a specific date
+     * This is the ONLY place where we proactively call IBKR for multiple symbols
+     */
+    public int fetchCandlesForDate(String date, int intervalMinutes) {
+        log.info("📊 Starting batch candle fetch for {} ({}min interval)", date, intervalMinutes);
+
+        // Get all symbols that have stock data for this date
+        List<StockData> stockDataList = stockDataRepository.findByDate(date);
+
+        if (stockDataList.isEmpty()) {
+            log.warn("No stock data found for {}", date);
+            return 0;
+        }
+
+        List<String> symbols = stockDataList.stream()
+                .map(StockData::getStockInfo)
+                .distinct()
+                .collect(Collectors.toList());
+
+        log.info("Found {} symbols to process", symbols.size());
+
+        int processed = 0;
+        int errors = 0;
+
+        for (String symbol : symbols) {
+            try {
+                // ✅ FIX: Rate limit each request
+                rateLimiter.acquire();
+
+                log.info("  Processing {}/{}: {}", processed + 1, symbols.size(), symbol);
+
+                // Fetch and cache (fetchFromIBKR already handles caching)
+                List<Candle> candles = fetchFromIBKR(symbol, date, intervalMinutes);
+
+                if (!candles.isEmpty()) {
+                    log.info("    ✅ Cached {} candles for {}", candles.size(), symbol);
+                    processed++;
+                } else {
+                    log.warn("    ⚠️ No candles returned for {}", symbol);
+                }
+
+                // ✅ FIX: Small delay between symbols to be nice to IBKR
+                Thread.sleep(100);
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.error("Interrupted while processing {}", symbol);
+                break;
+            } catch (Exception e) {
+                errors++;
+                log.error("  ❌ Error fetching {}: {}", symbol, e.getMessage());
+            }
+        }
+
+        log.info("✅ Batch fetch complete: {}/{} symbols processed, {} errors",
+                processed, symbols.size(), errors);
+
+        return processed;
+    }
+
+    /**
+     * ✅ BATCH FETCH MODE with date range
+     *
+     * Fetch candles for multiple dates
+     * ⚠️ Use with caution - can make many IBKR API calls
+     */
+    public int fetchCandlesForDateRange(String startDate, String endDate, int intervalMinutes) {
+        LocalDate start = LocalDate.parse(startDate);
+        LocalDate end = LocalDate.parse(endDate);
+
+        // ✅ FIX: Safety limit to prevent abuse
+        long daysBetween = ChronoUnit.DAYS.between(start, end);
+        if (daysBetween > 90) {
+            throw new IllegalArgumentException(
+                    "Date range too large. Maximum 90 days allowed. Requested: " + daysBetween + " days");
+        }
+
+        log.info("📅 Starting batch fetch for date range: {} to {} ({} days)",
+                startDate, endDate, daysBetween);
+
+        LocalDate currentDate = start;
+        int totalProcessed = 0;
+
+        while (!currentDate.isAfter(end)) {
+            String dateStr = currentDate.format(DateTimeFormatter.ISO_LOCAL_DATE);
+
+            try {
+                log.info("📆 Processing date: {}", dateStr);
+                int processed = fetchCandlesForDate(dateStr, intervalMinutes);
+                totalProcessed += processed;
+
+                // ✅ FIX: Delay between dates to prevent rate limiting
+                if (!currentDate.equals(end)) {
+                    Thread.sleep(2000); // 2 second pause between dates
+                }
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.error("Interrupted during date range fetch");
+                break;
+            } catch (Exception e) {
+                log.error("Error processing date {}: {}", dateStr, e.getMessage());
+            }
+
+            currentDate = currentDate.plusDays(1);
+        }
+
+        log.info("✅ Date range fetch complete: {} total symbols processed", totalProcessed);
+        return totalProcessed;
+    }
+
+    /**
+     * ✅ DIRECT IBKR FETCH
+     *
+     * Fetch candles directly from IBKR API
+     * Private - only called by controlled methods above
+     */
+    private List<Candle> fetchFromIBKR(String symbol, String date, int intervalMinutes) {
+        try {
+            log.debug("🌐 Calling IBKR API for {} on {}", symbol, date);
+
+            LocalDate targetDate = LocalDate.parse(date);
+
+            // Calculate how many days to fetch (optimize if we have recent data)
+            int daysToFetch = calculateDaysToFetch(symbol, date, intervalMinutes);
+
+            String durationStr = daysToFetch + " D";
+
+            log.debug("  Fetching {} days of data", daysToFetch);
+
+            // Ensure IBKR is connected
+            if (!ibkrClient.isConnected()) {
+                ibkrClient.connect();
+            }
+
+            // Format end date/time for IBKR (yyyyMMdd HH:mm:ss TZ)
+            String endDateTime = targetDate.format(DateTimeFormatter.BASIC_ISO_DATE) + " 23:59:59 UTC";
+
+            // Bar size setting
+            String barSizeSetting = intervalMinutes + (intervalMinutes == 1 ? " min" : " mins");
+
+            // Call IBKR (correct method signature)
+            List<Bar> bars = ibkrClient.getHistoricalBars(
+                    symbol,
+                    endDateTime,
+                    durationStr,
+                    barSizeSetting
+            );
+
+            if (bars == null || bars.isEmpty()) {
+                log.warn("⚠️ IBKR returned no data for {}", symbol);
+                return new ArrayList<>();
+            }
+
+            log.info("✅ IBKR returned {} bars for {}", bars.size(), symbol);
+
+            // Convert to Candle objects
+            List<Candle> allCandles = bars.stream()
+                    .filter(bar -> bar.time() != null && !bar.time().isEmpty())
+                    .map(bar -> {
+                        // IBKR returns time as epoch seconds
+                        long epochSeconds = Long.parseLong(bar.time());
+                        Instant timestamp = Instant.ofEpochSecond(epochSeconds);
+
+                        return Candle.builder()
+                                .timestamp(timestamp)
+                                .open(bar.open())
+                                .high(bar.high())
+                                .low(bar.low())
+                                .close(bar.close())
+                                .volume(bar.volume().value().longValue())
+                                .intervalMinutes(intervalMinutes)
+                                .build();
+                    })
+                    .collect(Collectors.toList());
+
+            log.info("✅ Converted {} IBKR bars to candles for {}", allCandles.size(), symbol);
+
+            // ✅ Cache each date separately (thread-safe upsert)
+            cachePerDate(symbol, allCandles, intervalMinutes);
+
+            // Return only the candles for the requested date + 4 days history
+            return allCandles.stream()
+                    .filter(c -> {
+                        LocalDate candleDate = c.getTimestamp().atZone(ZoneId.of("UTC")).toLocalDate();
+                        return !candleDate.isAfter(targetDate) &&
+                                !candleDate.isBefore(targetDate.minusDays(4));
+                    })
+                    .collect(Collectors.toList());
+
+        } catch (Exception e) {
+            // Check if it's an invalid symbol error (IBKR Error 200)
+            if (e.getMessage() != null && e.getMessage().contains("Error 200")) {
+                log.warn("❌ Invalid symbol or not found in IBKR: {} - {}", symbol, e.getMessage());
+            } else {
+                log.error("❌ Error fetching from IBKR for {}: {}", symbol, e.getMessage(), e);
+            }
+            return new ArrayList<>();
+        }
+    }
+
+    /**
      * Try to find candles from recently cached data
-     * If we fetched data for nearby dates, we might already have the data we need
      */
     private List<Candle> findCandlesFromRecentCache(String symbol, String targetDate, int intervalMinutes) {
         try {
             LocalDate target = LocalDate.parse(targetDate);
 
-            // Check the next 5 dates (they would have included our target date in their 5-day fetch)
+            // Check the next 5 dates
             for (int i = 1; i <= 5; i++) {
                 String nextDate = target.plusDays(i).format(DateTimeFormatter.ISO_LOCAL_DATE);
 
@@ -146,7 +430,6 @@ public class IBKRCandleService {
                         .findBySymbolAndDateAndIntervalMinutes(symbol, nextDate, intervalMinutes);
 
                 if (cached.isPresent()) {
-                    // This cache entry has 5 days of data, filter to get our target date's candles
                     List<Candle> allCandles = cached.get().getCandles();
 
                     List<Candle> targetCandles = allCandles.stream()
@@ -154,7 +437,6 @@ public class IBKRCandleService {
                                 LocalDate candleDate = c.getTimestamp()
                                         .atZone(ZoneId.of("UTC"))
                                         .toLocalDate();
-                                // Get all candles from target date backwards (for context)
                                 return !candleDate.isAfter(target) &&
                                         !candleDate.isBefore(target.minusDays(4));
                             })
@@ -177,271 +459,8 @@ public class IBKRCandleService {
     }
 
     /**
-     * Get candles for pattern analysis
-     * Returns candles for the requested date PLUS historical context (4 prev days)
-     *
-     * This loads from individual date caches and combines them
-     *
-     * @param symbol Stock symbol
-     * @param date Target date for analysis
-     * @param intervalMinutes Interval
-     * @return All candles from (date-4 days) to date
-     */
-    public List<Candle> getCandlesWithContext(String symbol, String date, int intervalMinutes) {
-        try {
-            LocalDate targetDate = LocalDate.parse(date);
-            List<Candle> allCandles = new ArrayList<>();
-
-            // Load candles for target date and previous 4 days
-            for (int i = 4; i >= 0; i--) {
-                LocalDate loadDate = targetDate.minusDays(i);
-                String loadDateStr = loadDate.format(DateTimeFormatter.ISO_LOCAL_DATE);
-
-                // Get candles for this date (will fetch if not cached)
-                List<Candle> dateCandles = getCandles(symbol, loadDateStr, intervalMinutes, false);
-                allCandles.addAll(dateCandles);
-            }
-
-            // Sort by timestamp
-            allCandles.sort(Comparator.comparing(Candle::getTimestamp));
-
-            log.debug("Loaded {} candles with context for {} on {}",
-                    allCandles.size(), symbol, date);
-
-            return allCandles;
-
-        } catch (Exception e) {
-            log.error("Error loading candles with context: {}", e.getMessage(), e);
-            // Fallback to just the target date
-            return getCandles(symbol, date, intervalMinutes, false);
-        }
-    }
-
-    /**
-     * Fetch and cache candles for all symbols on a specific date
-     * This is what you'll call to prepare data for daily alerts
-     *
-     * @param date Date in yyyy-MM-dd format
-     * @param intervalMinutes Interval (1, 5, 15, 30, 60)
-     * @param forceRefresh If true, re-fetch even if cached
-     * @return Number of symbols processed
-     */
-    public int fetchCandlesForDate(String date, int intervalMinutes, boolean forceRefresh) {
-        log.info("📅 Fetching candles for all symbols on {} ({}min interval, forceRefresh={})",
-                date, intervalMinutes, forceRefresh);
-
-        // Get all symbols that have data for this date (from stock_daily collection)
-        List<StockData> stockDataList = stockDataRepository.findByDate(date);
-
-        if (stockDataList.isEmpty()) {
-            log.warn("No symbols found for date: {}", date);
-            return 0;
-        }
-
-        List<String> symbols = stockDataList.stream()
-                .map(StockData::getStockInfo)
-                .distinct()
-                .collect(Collectors.toList());
-
-        log.info("Found {} symbols for {}: {}", symbols.size(), date, symbols);
-
-        int successCount = 0;
-        int skipCount = 0;
-
-        for (String symbol : symbols) {
-            try {
-                // Check if already cached (unless force refresh)
-                if (!forceRefresh) {
-                    boolean exists = candleDataRepository.existsBySymbolAndDateAndIntervalMinutes(
-                            symbol, date, intervalMinutes);
-
-                    if (exists) {
-                        log.debug("Skipping {} - already cached", symbol);
-                        skipCount++;
-                        continue;
-                    }
-                }
-
-                // Fetch from IBKR
-                log.info("Fetching {} ({}/{})", symbol, successCount + 1, symbols.size());
-                List<Candle> candles = getCandles(symbol, date, intervalMinutes, forceRefresh);
-
-                if (!candles.isEmpty()) {
-                    successCount++;
-                    log.info("✅ Cached {} candles for {}", candles.size(), symbol);
-                } else {
-                    log.warn("❌ No candles returned for {}", symbol);
-                }
-
-                // Rate limiting: Sleep to avoid hitting IBKR API limits
-                // IBKR allows 60 requests per 10 minutes = 1 per 10 seconds to be safe
-                Thread.sleep(10000);
-
-            } catch (InterruptedException e) {
-                log.error("Interrupted while processing {}", symbol);
-                Thread.currentThread().interrupt();
-                break;
-            } catch (Exception e) {
-                log.error("Error fetching candles for {}: {}", symbol, e.getMessage(), e);
-            }
-        }
-
-        log.info("🎯 Fetch complete: {} fetched, {} skipped, {} total",
-                successCount, skipCount, symbols.size());
-
-        return successCount;
-    }
-
-    /**
-     * Convenience method - calls fetchCandlesForDate with forceRefresh=false
-     */
-    public int fetchCandlesForDate(String date, int intervalMinutes) {
-        return fetchCandlesForDate(date, intervalMinutes, false);
-    }
-
-    /**
-     * Fetch candles for multiple dates (batch processing for historical data)
-     *
-     * @param startDate Start date (inclusive)
-     * @param endDate End date (inclusive)
-     * @param intervalMinutes Interval
-     * @return Total number of symbol-dates processed
-     */
-    public int fetchCandlesForDateRange(String startDate, String endDate, int intervalMinutes) {
-        log.info("📅 Fetching candles from {} to {} ({}min interval)", startDate, endDate, intervalMinutes);
-
-        LocalDate start = LocalDate.parse(startDate);
-        LocalDate end = LocalDate.parse(endDate);
-
-        int totalProcessed = 0;
-        LocalDate current = start;
-
-        while (!current.isAfter(end)) {
-            String dateStr = current.format(DateTimeFormatter.ISO_LOCAL_DATE);
-
-            // Skip weekends
-            if (current.getDayOfWeek().getValue() >= 6) {
-                log.debug("Skipping weekend: {}", dateStr);
-                current = current.plusDays(1);
-                continue;
-            }
-
-            log.info("\n========== Processing {} ==========", dateStr);
-            int processed = fetchCandlesForDate(dateStr, intervalMinutes);
-            totalProcessed += processed;
-
-            current = current.plusDays(1);
-
-            // Extra sleep between dates to be extra safe with API limits
-            if (!current.isAfter(end)) {
-                try {
-                    log.info("Waiting 60 seconds before next date...");
-                    Thread.sleep(60000);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-        }
-
-        log.info("\n🎉 COMPLETE: Processed {} symbol-dates from {} to {}",
-                totalProcessed, startDate, endDate);
-
-        return totalProcessed;
-    }
-
-    /**
-     * Fetch candles from IBKR API and cache per-date
-     */
-    private List<Candle> fetchFromIBKR(String symbol, String date, int intervalMinutes) {
-        try {
-            log.info("Fetching historical bars from IBKR: symbol={}, date={}, interval={}min",
-                    symbol, date, intervalMinutes);
-
-            // Ensure connected
-            if (!ibkrClient.isConnected()) {
-                ibkrClient.connect();
-            }
-
-            // Check how many days we actually need to fetch
-            int daysToFetch = calculateDaysToFetch(symbol, date, intervalMinutes);
-
-            // Format end date/time for IBKR
-            // IBKR requires explicit timezone: "yyyyMMdd HH:mm:ss TZ"
-            String endDateTime = date.replace("-", "") + " 23:59:59 UTC";
-
-            // Duration: Fetch only what we need
-            String durationStr = daysToFetch + " D";
-
-            log.info("Fetching {} days of data for {} (to have 5 days total context)",
-                    daysToFetch, symbol);
-
-            // Bar size setting
-            String barSizeSetting = intervalMinutes + (intervalMinutes == 1 ? " min" : " mins");
-
-            // Request historical bars
-            List<Bar> bars = ibkrClient.getHistoricalBars(
-                    symbol,
-                    endDateTime,
-                    durationStr,
-                    barSizeSetting
-            );
-
-            if (bars.isEmpty()) {
-                log.warn("No bars returned from IBKR for {}", symbol);
-                return new ArrayList<>();
-            }
-
-            // Convert IBKR bars to our Candle objects
-            List<Candle> allCandles = bars.stream()
-                    .map(bar -> {
-                        // IBKR returns time as epoch seconds (when formatDate=2)
-                        // bar.time() returns a string like "1759843800"
-                        long epochSeconds = Long.parseLong(bar.time());
-                        Instant timestamp = Instant.ofEpochSecond(epochSeconds);
-
-                        return Candle.builder()
-                                .timestamp(timestamp)
-                                .open(bar.open())
-                                .high(bar.high())
-                                .low(bar.low())
-                                .close(bar.close())
-                                .volume(bar.volume().value().longValue())
-                                .intervalMinutes(intervalMinutes)
-                                .build();
-                    })
-                    .collect(Collectors.toList());
-
-            log.info("✅ Converted {} IBKR bars to candles for {}", allCandles.size(), symbol);
-
-            // ✅ NEW: Cache each date separately
-            cachePerDate(symbol, allCandles, intervalMinutes);
-
-            // Return only the candles for the requested date + 4 days history
-            LocalDate targetDate = LocalDate.parse(date);
-            return allCandles.stream()
-                    .filter(c -> {
-                        LocalDate candleDate = c.getTimestamp().atZone(ZoneId.of("UTC")).toLocalDate();
-                        return !candleDate.isAfter(targetDate) &&
-                                !candleDate.isBefore(targetDate.minusDays(4));
-                    })
-                    .collect(Collectors.toList());
-
-        } catch (Exception e) {
-            // Check if it's an invalid symbol error (IBKR Error 200)
-            if (e.getMessage() != null && e.getMessage().contains("Error 200")) {
-                log.warn("❌ Invalid symbol or not found in IBKR: {} - {}", symbol, e.getMessage());
-            } else {
-                log.error("Error fetching from IBKR for {}: {}", symbol, e.getMessage(), e);
-            }
-            return new ArrayList<>();
-        }
-    }
-
-    /**
      * Cache candles separately for each date
-     * This prevents overwrite conflicts when force refreshing
-     * Uses UPSERT to prevent duplicates
+     * ✅ Thread-safe with upsert to prevent duplicates
      */
     private void cachePerDate(String symbol, List<Candle> allCandles, int intervalMinutes) {
         // Group candles by date
@@ -456,40 +475,17 @@ public class IBKRCandleService {
             List<Candle> dateCandles = entry.getValue();
 
             try {
-                // Build the document
-                CandleData candleData = CandleData.builder()
-                        .symbol(symbol)
-                        .date(dateStr)
-                        .intervalMinutes(intervalMinutes)
-                        .candles(dateCandles)
-                        .source("IBKR")
-                        .fetchedAt(System.currentTimeMillis())
-                        .build();
-
-                // UPSERT: Update if exists, insert if not
-                // This prevents duplicates by using the unique index
-                Query query = new Query(Criteria.where("symbol").is(symbol)
-                        .and("date").is(dateStr)
-                        .and("intervalMinutes").is(intervalMinutes));
-
-                Update update = new Update()
-                        .set("candles", dateCandles)
-                        .set("source", "IBKR")
-                        .set("fetchedAt", System.currentTimeMillis());
-
-                mongoTemplate.upsert(query, update, CandleData.class);
-
-                log.debug("💾 Upserted {} candles for {} on {}", dateCandles.size(), symbol, dateStr);
+                upsertCandles(symbol, dateStr, intervalMinutes, dateCandles);
+                log.debug("💾 Cached {} candles for {} on {}", dateCandles.size(), symbol, dateStr);
 
             } catch (Exception e) {
-                log.error("Error upserting candles for {} on {}: {}", symbol, dateStr, e.getMessage());
+                log.error("Error caching candles for {} on {}: {}", symbol, dateStr, e.getMessage());
             }
         }
     }
 
     /**
      * Calculate how many days to fetch from IBKR
-     * If we have recent cache, we don't need to fetch all 5 days
      */
     private int calculateDaysToFetch(String symbol, String targetDate, int intervalMinutes) {
         try {
@@ -501,7 +497,6 @@ public class IBKRCandleService {
 
                 if (candleDataRepository.existsBySymbolAndDateAndIntervalMinutes(
                         symbol, prevDate, intervalMinutes)) {
-                    // We have recent data! Only fetch from that point forward
                     log.debug("Found cached data at {}, fetching only {} days", prevDate, daysBack);
                     return daysBack;
                 }
@@ -512,13 +507,12 @@ public class IBKRCandleService {
 
         } catch (Exception e) {
             log.debug("Error calculating days to fetch: {}", e.getMessage());
-            return 5; // Default to 5 days on error
+            return 5;
         }
     }
 
     /**
-     * Upsert candles to MongoDB (update if exists, insert if not)
-     * This prevents duplicate key errors
+     * ✅ Thread-safe upsert to prevent duplicate key errors
      */
     private void upsertCandles(String symbol, String date, int intervalMinutes, List<Candle> candles) {
         try {
@@ -528,6 +522,7 @@ public class IBKRCandleService {
 
             Update update = new Update()
                     .set("candles", candles)
+                    .set("candleCount", candles.size())
                     .set("source", "IBKR")
                     .set("fetchedAt", System.currentTimeMillis());
 
@@ -562,7 +557,7 @@ public class IBKRCandleService {
     }
 
     /**
-     * Clear cache for a specific date (useful for re-fetching)
+     * Clear cache for a specific date
      */
     public void clearCache(String date) {
         List<CandleData> cached = candleDataRepository.findByDate(date);

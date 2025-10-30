@@ -17,9 +17,9 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
- * ✅ UPDATED: Now uses IBKR candles instead of building from ticks
+ * ✅ FIXED: Now uses CACHE-ONLY mode (never calls IBKR)
  *
- * Service for analyzing stock patterns
+ * Service for analyzing stock patterns from cached historical data
  * This is the main entry point for pattern detection
  */
 @Service
@@ -34,7 +34,7 @@ public class PatternAnalysisService {
     /**
      * Analyze a stock for patterns on a specific date
      *
-     * ✅ NEW: Uses IBKR candles instead of CandleBuilderService
+     * ✅ FIXED: Uses CACHE-ONLY mode - never fetches from IBKR
      *
      * @param symbol Stock symbol
      * @param date Date in yyyy-MM-dd format
@@ -56,11 +56,11 @@ public class PatternAnalysisService {
             return new ArrayList<>();
         }
 
-        // ✅ Get candles from CACHE ONLY (never fetch from IBKR during analysis)
+        // ✅ FIXED: Get candles from CACHE ONLY (never fetch from IBKR during analysis)
         List<Candle> candles = ibkrCandleService.getCandlesFromCacheOnly(symbol, date, intervalMinutes);
 
         if (candles.isEmpty()) {
-            log.warn("No candles available for {} on {}", symbol, date);
+            log.warn("No cached candles for {} on {} - run /api/candles/fetch-date first", symbol, date);
             return new ArrayList<>();
         }
 
@@ -94,6 +94,8 @@ public class PatternAnalysisService {
 
     /**
      * Analyze multiple stocks for a specific date
+     *
+     * ✅ FIXED: Uses CACHE-ONLY mode
      *
      * @param date Date in yyyy-MM-dd format
      * @param intervalMinutes Candle interval
