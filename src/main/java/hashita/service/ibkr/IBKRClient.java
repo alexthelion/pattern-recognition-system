@@ -152,9 +152,9 @@ public class IBKRClient implements EWrapper {
                 new ArrayList<>()
         );
 
-        // Wait for response (timeout after 30 seconds)
+        // Wait for response (timeout after 60 seconds)
         try {
-            List<Bar> bars = future.get(30, TimeUnit.SECONDS);
+            List<Bar> bars = future.get(60, TimeUnit.SECONDS);
             log.info("✅ Received {} bars for {}", bars.size(), symbol);
             return bars;
 
@@ -320,21 +320,28 @@ public class IBKRClient implements EWrapper {
 
     @Override
     public void error(int id, int errorCode, String errorMsg, String advancedOrderRejectJson) {
-        log.warn("IBKR Error: id={}, code={}, msg={}", id, errorCode, errorMsg);
+        log.error("🔴 IBKR Error [ReqId: {}, Code: {}, Msg: {}]", id, errorCode, errorMsg);
 
-        // Complete futures with exception for serious errors
-        if (errorCode >= 500) {
-            CompletableFuture<List<Bar>> histFuture = pendingRequests.get(id);
-            if (histFuture != null) {
-                histFuture.completeExceptionally(
-                        new RuntimeException("IBKR Error " + errorCode + ": " + errorMsg));
-            }
+        // Warnings (don't fail)
+        if (errorCode >= 2100 && errorCode < 2200) {
+            return;
+        }
 
-            CompletableFuture<Double> priceFuture = pendingPriceRequests.get(id);
-            if (priceFuture != null) {
-                priceFuture.completeExceptionally(
-                        new RuntimeException("IBKR Error " + errorCode + ": " + errorMsg));
+        // "No data" errors (return empty, don't timeout)
+        if (errorCode == 162 || errorCode == 200) {
+            log.warn("  ⚠️ No data available for reqId {}", id);
+            CompletableFuture<List<Bar>> future = pendingRequests.get(id);
+            if (future != null && !future.isDone()) {
+                future.complete(new ArrayList<>());  // Empty, not timeout!
             }
+            return;
+        }
+
+        // Real errors
+        CompletableFuture<List<Bar>> future = pendingRequests.get(id);
+        if (future != null && !future.isDone()) {
+            future.completeExceptionally(
+                    new RuntimeException("IBKR Error " + errorCode + ": " + errorMsg));
         }
     }
 

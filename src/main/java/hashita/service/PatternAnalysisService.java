@@ -56,8 +56,9 @@ public class PatternAnalysisService {
             return new ArrayList<>();
         }
 
-        // ✅ FIXED: Get candles from CACHE ONLY (never fetch from IBKR during analysis)
-        List<Candle> candles = ibkrCandleService.getCandlesFromCacheOnly(symbol, date, intervalMinutes);
+        // ✅ FIXED - Get 5 days of candles for proper pattern context
+        List<Candle> candles =
+                ibkrCandleService.getCandlesWithContext(symbol, date, intervalMinutes, false);
 
         if (candles.isEmpty()) {
             log.warn("No cached candles for {} on {} - run /api/candles/fetch-date first", symbol, date);
@@ -77,9 +78,9 @@ public class PatternAnalysisService {
 
         // ✅ FILTER: Only return patterns from the requested date!
         LocalDate targetDate = LocalDate.parse(date);
-        List<PatternRecognitionResult> patternsForDate = allPatterns.stream()
-                .filter(pattern -> {
-                    LocalDate patternDate = pattern.getTimestamp()
+        List<PatternRecognitionResult> targetDatePatterns = allPatterns.stream()
+                .filter(p -> {
+                    LocalDate patternDate = p.getTimestamp()
                             .atZone(ZoneId.of("UTC"))
                             .toLocalDate();
                     return patternDate.equals(targetDate);
@@ -87,9 +88,9 @@ public class PatternAnalysisService {
                 .collect(Collectors.toList());
 
         log.info("Found {} patterns for {} on {} (out of {} total from context)",
-                patternsForDate.size(), symbol, date, allPatterns.size());
+                targetDatePatterns.size(), symbol, date, allPatterns.size());
 
-        return patternsForDate;
+        return targetDatePatterns;
     }
 
     /**
